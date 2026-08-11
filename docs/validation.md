@@ -42,6 +42,23 @@ and warns — in physical units (implied transverse sample offset in mm, 1D
 doublet splitting in bins) — when the geometry error is large enough to
 corrupt peak fitting.
 
+**Correlation contracts are verified with synthetic Analysis HDF5 files.**
+`tests/test_correlations_processing.py` fixes the pooled bounded Log² formula,
+the positive ROI and signed-residual window branches sharing one scale and
+epsilon, zero/NaN behavior, native-axis location score, the powder 0.75×width
+directional absolute-support IoU (including asymmetry and disjoint support),
+the single-crystal scalar min/max rule, all-observation/no-track-collapse
+policy, standardized positive-lag FFT-ACF behavior, window matrix shapes,
+HDF5 provenance, and atomic output. The CLI test writes and reopens the
+sample-specific correlation HDF5 and renders PNGs with no display.
+
+**Restricted-host parallel fallback is tested explicitly.**
+`tests/test_batch_parallel.py` forces process-pool semaphore creation to raise
+`PermissionError` and verifies ordered serial fallback, while a separate test
+confirms that a real scientific calculation error is still raised rather than
+silently swallowed. The same helper covers background separation, peak
+fitting, phase simulation, and frame scoring.
+
 ## Expected tolerances
 
 - **Calibration/geometry:** limited by pyFAI refinement on your calibrant
@@ -86,6 +103,60 @@ These outputs are for guidance and screening, not for quantitative claims:
 - **Unknown clusters** (`/unknowns`): coherent residual-peak tracks are
   *candidates* for real phases; a cluster is a hypothesis with a
   d-fingerprint, not an identification.
+- **Correlation similarities** (`correlations_<sample_type>.h5`): comparisons
+  within the selected series, not probabilities and not phase identities. A
+  high score says that the selected feature is similar under the recorded
+  algorithm; it does not prove crystallographic equivalence.
+
+## Correlation-specific assumptions and limits
+
+- **Log² is a fixed nonlinear transform, not spatial denoising.** Analysis
+  performs background correction first. ROI calculations positive-clip the
+  selected channel. Window calculations retain the signed residual, normalize
+  it with the same pooled Q99.5 scale and noise-derived epsilon, clip to
+  `[-1, 1]`, and then square it in the bounded Log² formula. Per-frame
+  rescaling is intentionally not used because it would erase real cross-frame
+  intensity changes.
+- **Location is independent of Log².** It is
+  `clip(1 - |center_i-center_j| / tolerance, 0, 1)` in the HDF5 native radial
+  unit. When reproducing the UOTe historical setting on a 2θ axis, set the
+  tolerance to `0.06°`; q-axis data require a tolerance in inverse angstroms.
+- **Powder ROI similarity is directional.** It uses the anchor's absolute
+  `[center - 0.75×width, center + 0.75×width]` support, with the target set to
+  zero outside its own physical support. `A→B` and `B→A` can differ. This is
+  expected, not a matrix-symmetry bug.
+- **Single-crystal ROI is currently a one-dimensional approximation.** Every
+  `/spots/obs` row is retained, but the feature is the mean positive-Log²
+  radial ROI from the Analysis source. It cannot exactly reproduce the UOTe
+  prototype's masked, sideband-subtracted, exposure-normalized raw-TIFF pixel
+  feature because the Analysis HDF5 does not carry those raw pixel instances
+  or exposure metadata. Do not describe this result as pixel-level Log² ROI.
+  The GUI and CLI therefore select/recommend the `spots` source for
+  single-crystal work.
+- **Waterfall height and color have different sources.** Curve height is the
+  original-positive pre-transform Analysis profile, normalized only for plot
+  stacking. ROI shading is the Log² correlation result. The figure label and
+  HDF5 attributes record this separation.
+- **Pressure is organizational metadata.** It determines labels/subfolders;
+  it is not an input to the similarity formulas. Missing pressure does not
+  invalidate a correlation run.
+- **All-peak matrices scale quadratically.** ROI and location arrays have
+  shape `K×K`. Very large observation tables can require substantial memory
+  and disk; choose a defensible radial range and retain the generated HDF5 for
+  reproducibility.
+- **Structural peak cells stay missing.** ROI/location comparisons against
+  peaks in the anchor's own frame are stored as `NaN` and plotted blank; they
+  are not computed zeros.
+- **Pearson windows can be undefined.** A constant or structurally invalid
+  window has no variance and is stored as `NaN`, not forced to zero. FFT-ACF
+  fingerprints are standardized, use positive lags only, and exclude lag
+  zero. Across frames includes direct and ACF-fingerprint maps; within frames
+  uses ACF fingerprints. Window width and step are expressed in the selected
+  HDF5 native radial unit, and width must not exceed the selected span.
+- **Prototype-only window products are intentionally absent.** The supported
+  MVP does not migrate `shift_tolerant_secondary` or same-scan aggregation.
+  The public Analysis HDF5 has no stable `scan_id`, so such aggregation would
+  require an unsupported inference about experimental acquisition order.
 
 ## Why the refinement export is not Rietveld refinement
 

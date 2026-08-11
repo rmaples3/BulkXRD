@@ -47,6 +47,7 @@ def test_calibration_and_reduction_use_left_rail_navigation(tmp_path):
             app.reduce_pane: (
                 "calibration", "dataset", "settings", "run", "review", "gallery"
             ),
+            app.correlation_pane: ("input", "settings", "run", "results"),
         }
         for pane, page_keys in expected_pages.items():
             assert tuple(pane.pages) == page_keys

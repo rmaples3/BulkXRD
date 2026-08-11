@@ -25,6 +25,7 @@ env/
 calibration_session_config.json
 reduction_session_config.json
 analysis_session_config.json
+correlation_session_config.json
 last_preflight.json
 calibration_handoff.json
 master_metadata.json
@@ -36,6 +37,7 @@ metadata/
 logs/
 previews/
 outputs/
+/correlations/
 
 # Logs and editor settings
 *.log

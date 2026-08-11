@@ -31,6 +31,10 @@ mods = [
     'seriesxrd.analysis.fractions', 'seriesxrd.analysis.refine_export',
     'seriesxrd.analysis.refine_import',
     'seriesxrd.analysis.spots',
+    'seriesxrd.correlations', 'seriesxrd.correlations.processing',
+    'seriesxrd.correlations.plots', 'seriesxrd.correlations.review',
+    'seriesxrd.correlations.session', 'seriesxrd.correlations.batch',
+    'seriesxrd.correlations.gui', 'seriesxrd.correlations.run_gui',
     'seriesxrd.reduce.straighten', 'seriesxrd.reduce.texture',
     'seriesxrd.reduce.watch',
 ]

@@ -1,0 +1,392 @@
+"""Numerical and HDF5 contracts for the Correlations stage."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pytest
+
+from seriesxrd.correlations.processing import (
+    compute_window_correlations,
+    directional_anchor_iou,
+    integrated_iou,
+    location_similarity,
+    log_squared_transform,
+    relative_feature_similarity,
+    run_correlations,
+)
+from seriesxrd.correlations.review import inspect_correlations, load_anchor_map
+
+
+def _gaussian(x, center, width, amplitude):
+    return amplitude * np.exp(-0.5 * ((x - center) / width) ** 2)
+
+
+def _write_analysis(path: Path, *, include_spots: bool = True) -> Path:
+    radial = np.linspace(0.0, 10.0, 241)
+    n_frames = 4
+    clean = np.zeros((n_frames, radial.size), dtype=float)
+    peak_rows = []
+    spot_rows = []
+    for frame in range(n_frames):
+        shift = 0.03 * frame
+        clean[frame] = (
+            0.4
+            + _gaussian(radial, 2.0 + shift, 0.10, 8.0 + frame)
+            + _gaussian(radial, 6.0 - shift, 0.16, 5.0 + 0.5 * frame)
+        )
+        for center, width, area in (
+            (2.0 + shift, 0.24, 8.0 + frame),
+            (6.0 - shift, 0.32, 5.0 + frame),
+        ):
+            peak_rows.append((frame, center, width, area))
+        if include_spots:
+            # Three observations per frame but only two track ids. Correlations
+            # must retain all 12 observations as independent anchors.
+            for local, (center, width, area) in enumerate(
+                (
+                    (2.0 + shift, 0.12, 8.0 + frame),
+                    (4.0 + 0.01 * frame, 0.10, 4.0 + frame),
+                    (6.0 - shift, 0.15, 5.0 + frame),
+                )
+            ):
+                spot_rows.append(
+                    (frame, center, width, area, local % 2)
+                )
+    # A signed residual bin outside every peak support distinguishes the
+    # positive ROI path from the signed-input window path.
+    clean[:, 100] = -np.asarray([0.75, 1.0, 1.25, 1.5])
+
+    with h5py.File(str(path), "w") as h5:
+        h5.attrs["unit"] = "2th_deg"
+        h5.attrs["source_reduced"] = str(path.with_name("synthetic_reduced.h5"))
+        h5.create_dataset("radial", data=radial)
+        background = h5.create_group("background")
+        background.create_dataset("clean", data=clean)
+        background.create_dataset("baseline", data=np.zeros_like(clean))
+        background.create_dataset("spot_residual", data=0.2 * clean)
+        frames = h5.create_group("frames")
+        frames.create_dataset(
+            "filename",
+            data=np.asarray([f"scan_{i:03d}.tif" for i in range(n_frames)], object),
+            dtype=h5py.string_dtype("utf-8"),
+        )
+        frames.create_dataset("pressure", data=np.asarray([1.0, 1.0, 5.0, 5.0]))
+        frames.create_dataset("excluded", data=np.zeros(n_frames, bool))
+
+        peaks = h5.create_group("peaks")
+        peaks.attrs["source"] = "clean"
+        peak_array = np.asarray(peak_rows, dtype=float)
+        peaks.create_dataset("frame", data=peak_array[:, 0].astype("i4"))
+        peaks.create_dataset("center", data=peak_array[:, 1])
+        peaks.create_dataset("fwhm", data=peak_array[:, 2])
+        peaks.create_dataset("area", data=peak_array[:, 3])
+        peaks.create_dataset("flag", data=np.zeros(len(peak_rows), "i4"))
+        peaks.create_dataset("counts", data=np.full(n_frames, 2, "i4"))
+
+        if include_spots:
+            spots = h5.create_group("spots").create_group("obs")
+            spot_array = np.asarray(spot_rows, dtype=float)
+            spots.create_dataset("frame", data=spot_array[:, 0].astype("i4"))
+            spots.create_dataset("q", data=spot_array[:, 1])
+            spots.create_dataset("q_width", data=spot_array[:, 2])
+            spots.create_dataset("area", data=spot_array[:, 3])
+            spots.create_dataset("intensity", data=spot_array[:, 3])
+            spots.create_dataset("track", data=spot_array[:, 4].astype("i4"))
+            spots.create_dataset(
+                "pressure", data=np.repeat([1.0, 1.0, 5.0, 5.0], 3)
+            )
+    return path
+
+
+def test_log_squared_is_fixed_bounded_and_uses_one_scale():
+    values = np.asarray([[-2.0, 0.0, 5.0], [10.0, 20.0, np.nan]])
+    transformed, params = log_squared_transform(
+        values, scale=10.0, noise_floor=1.0
+    )
+    epsilon = 0.01
+    expected_mid = np.log1p(0.5**2 / epsilon) / np.log1p(1.0 / epsilon)
+    assert params.method == "log_squared"
+    assert params.scale == 10.0 and params.epsilon == pytest.approx(epsilon)
+    assert transformed[0, 0] == 0.0
+    assert transformed[0, 1] == 0.0
+    assert transformed[0, 2] == pytest.approx(expected_mid)
+    assert transformed[1, 0] == 1.0 and transformed[1, 1] == 1.0
+    assert np.isnan(transformed[1, 2])
+    assert np.nanmin(transformed) >= 0.0 and np.nanmax(transformed) <= 1.0
+
+
+def test_core_similarity_contracts_include_scalar_location():
+    x = np.linspace(-1.0, 1.0, 21)
+    peak = np.exp(-0.5 * (x / 0.25) ** 2)
+    assert integrated_iou(peak, peak, x) == pytest.approx(1.0)
+    assert integrated_iou(
+        np.r_[np.ones(10), np.zeros(11)],
+        np.r_[np.zeros(10), np.ones(11)],
+        x,
+    ) == pytest.approx(0.0)
+    assert np.isnan(integrated_iou(np.zeros_like(x), np.zeros_like(x), x))
+    scalar = location_similarity(1.0, 1.01, tolerance=0.02)
+    assert np.asarray(scalar).shape == ()
+    assert float(scalar) == pytest.approx(0.5)
+    assert np.isnan(float(location_similarity(np.nan, 1.0, tolerance=0.02)))
+
+
+def test_window_fft_acf_uses_every_positive_lag_and_preserves_invalidity():
+    radial = np.linspace(0.0, 4.0, 65)
+    phase = np.linspace(0.0, 4.0 * np.pi, radial.size)
+    transformed = np.vstack(
+        (
+            np.sin(phase) ** 2,
+            np.cos(phase + 0.2) ** 2,
+            np.ones(radial.size),
+        )
+    )
+    result = compute_window_correlations(
+        radial,
+        transformed,
+        window_width=4.0,
+        window_step=1.0,
+    )
+    assert result["start"].shape == (1,)
+    assert result["acf_features"].shape == (3, 1, 63)
+    for fingerprint in result["acf_features"][:2, 0]:
+        assert np.all(np.isfinite(fingerprint))
+        assert np.mean(fingerprint) == pytest.approx(0.0, abs=1.0e-12)
+        assert np.std(fingerprint) == pytest.approx(1.0, abs=1.0e-12)
+    assert np.all(np.isnan(result["acf_features"][2, 0]))
+    assert np.all(np.isnan(result["across_acf"][0, 2]))
+    assert np.all(np.isnan(result["across_acf"][0, :, 2]))
+    assert np.isnan(result["within_acf"][2, 0, 0])
+
+    masked = transformed.copy()
+    masked[0, 10] = np.nan
+    masked_result = compute_window_correlations(
+        radial,
+        masked,
+        window_width=4.0,
+        window_step=1.0,
+    )
+    assert np.all(np.isnan(masked_result["signals"][0, 0]))
+    assert np.all(np.isnan(masked_result["acf_features"][0, 0]))
+
+    with pytest.raises(ValueError, match="exceed the selected radial span"):
+        compute_window_correlations(
+            radial,
+            transformed,
+            window_width=4.01,
+            window_step=1.0,
+        )
+
+
+def test_frozen_powder_directional_absolute_support_contract():
+    radial = np.linspace(0.0, 4.0, 401)
+    anchor = np.ones(radial.size)
+    target = np.ones(radial.size)
+    broad_to_narrow = directional_anchor_iou(
+        radial,
+        anchor,
+        target,
+        anchor_support=(1.0, 3.0),
+        target_support=(1.5, 2.5),
+    )
+    narrow_to_broad = directional_anchor_iou(
+        radial,
+        target,
+        anchor,
+        anchor_support=(1.5, 2.5),
+        target_support=(1.0, 3.0),
+    )
+    assert broad_to_narrow == pytest.approx(0.5)
+    assert narrow_to_broad == pytest.approx(1.0)
+    assert broad_to_narrow != narrow_to_broad
+    assert directional_anchor_iou(
+        radial,
+        anchor,
+        target,
+        anchor_support=(0.5, 1.0),
+        target_support=(2.0, 2.5),
+    ) == pytest.approx(0.0)
+    assert directional_anchor_iou(
+        radial,
+        np.zeros_like(anchor),
+        np.zeros_like(target),
+        anchor_support=(1.0, 2.0),
+        target_support=(1.0, 2.0),
+    ) == pytest.approx(0.0)
+
+
+def test_frozen_single_scalar_minmax_contract_including_both_zero():
+    features = np.asarray([0.0, 2.0, 4.0])
+    matrix = relative_feature_similarity(features[:, None], features[None, :])
+    assert matrix[0, 0] == 1.0
+    assert matrix[0, 1] == 0.0
+    assert matrix[1, 2] == pytest.approx(0.5)
+    assert np.allclose(np.diag(matrix), 1.0)
+
+
+def test_powder_end_to_end_writes_atomic_schema_and_manifest(tmp_path):
+    analysis = _write_analysis(tmp_path / "analysis.h5")
+    out = tmp_path / "powder_correlations"
+    manifest = run_correlations(
+        analysis,
+        out,
+        sample_type="powder",
+        window_width=4.0,
+        window_step=3.0,
+        location_tolerance=0.25,
+        make_plots=False,
+    )
+
+    artifact = out / "correlations_powder.h5"
+    manifest_path = out / "manifest_powder.json"
+    assert artifact.is_file() and manifest_path.is_file()
+    assert not (out / "correlations_powder.h5.tmp").exists()
+    assert not (out / "manifest_powder.json.tmp").exists()
+    assert manifest["n_peaks"] == 8
+    assert manifest["track_collapsed"] is False
+    assert manifest["plots_written"] == 0
+    assert manifest["source_requested"] == "fit"
+
+    with h5py.File(str(artifact), "r") as h5:
+        assert h5.attrs["sample_type"] == "powder"
+        assert h5.attrs["all_peak_policy"].startswith("one anchor")
+        assert h5["transform"].attrs["method"] == "log_squared"
+        assert h5["patterns/original_positive"].shape == (4, 241)
+        assert h5["patterns/log_squared"].shape == (4, 241)
+        assert h5["patterns/log_squared_signed"].shape == (4, 241)
+        assert np.all(h5["patterns/log_squared"][:, 100] == 0.0)
+        assert np.all(h5["patterns/log_squared_signed"][:, 100] > 0.0)
+        with h5py.File(str(analysis), "r") as source_h5:
+            signed_source = np.asarray(source_h5["background/clean"][:], float)
+        _, expected_transform = log_squared_transform(signed_source)
+        assert h5["transform"].attrs["scale"] == pytest.approx(
+            expected_transform.scale
+        )
+        assert h5["transform"].attrs["noise_floor"] == pytest.approx(
+            expected_transform.noise_floor
+        )
+        assert h5["anchor_maps/roi_area"].shape == (8, 8)
+        assert h5["anchor_maps/location"].shape == (8, 8)
+        assert h5["anchor_maps/location"].attrs["intensity_transform"] == "none"
+        assert bool(h5.attrs["roi_area_directional"])
+        assert "no_recentering" in h5.attrs["roi_area_method"]
+        np.testing.assert_allclose(
+            h5["peaks/half_width"][:],
+            0.75 * h5["peaks/width"][:],
+            rtol=0.0,
+            atol=0.0,
+        )
+        peak_frames = np.asarray(h5["peaks/frame_row"][:], int)
+        same_frame = peak_frames[:, None] == peak_frames[None, :]
+        roi_area = np.asarray(h5["anchor_maps/roi_area"][:], float)
+        location = np.asarray(h5["anchor_maps/location"][:], float)
+        assert np.all(np.isnan(roi_area[same_frame]))
+        assert np.all(np.isnan(location[same_frame]))
+        assert np.any(np.isfinite(roi_area[~same_frame]))
+        assert np.any(np.isfinite(location[~same_frame]))
+        assert h5["windows/across_direct"].shape == (3, 4, 4)
+        assert h5["windows/across_acf"].shape == (3, 4, 4)
+        assert h5["windows/within_acf"].shape == (4, 3, 3)
+        assert h5["windows/acf_features"].shape == (4, 3, 63)
+        assert (
+            h5["windows"].attrs["acf_method"]
+            == "standardized_positive_lag_fft_acf"
+        )
+        assert (
+            h5["windows"].attrs["acf_lag_policy"]
+            == "all_positive_lags;zero_lag_excluded"
+        )
+        assert h5["windows"].attrs["acf_lag_count"] == 63
+        assert "provenance" in h5
+
+    review = inspect_correlations(artifact)
+    assert review["ok"], review["anomalies"]
+    anchor = load_anchor_map(artifact, "roi_area", 0)
+    assert anchor["grid"].shape == (4, 2)
+    assert anchor["vector"].shape == (8,)
+    on_disk_manifest = json.loads(manifest_path.read_text())
+    assert on_disk_manifest["transform"]["method"] == "log_squared"
+    assert on_disk_manifest["same_frame_policy"] == "NaN"
+    assert (
+        on_disk_manifest["window_acf_method"]
+        == "standardized_positive_lag_fft_acf"
+    )
+    assert on_disk_manifest["window_acf_lag_count"] == 63
+
+
+def test_single_crystal_retains_every_observation_not_tracks(tmp_path):
+    analysis = _write_analysis(tmp_path / "analysis.h5")
+    out = tmp_path / "shared_correlations"
+    powder_manifest = run_correlations(
+        analysis,
+        out,
+        sample_type="powder",
+        window_width=5.0,
+        window_step=5.0,
+        make_plots=False,
+    )
+    manifest = run_correlations(
+        analysis,
+        out,
+        sample_type="single_crystal",
+        window_width=5.0,
+        window_step=5.0,
+        make_plots=False,
+    )
+    assert manifest["n_peaks"] == 12
+    assert manifest["source_requested"] == "spots"
+    assert manifest["source_resolved"] == "spots"
+    assert Path(powder_manifest["correlations_h5"]).name == "correlations_powder.h5"
+    assert (out / "correlations_powder.h5").is_file()
+    assert (out / "manifest_powder.json").is_file()
+    assert (out / "correlations_single_crystal.h5").is_file()
+    assert (out / "manifest_single_crystal.json").is_file()
+    with h5py.File(str(out / "correlations_single_crystal.h5"), "r") as h5:
+        assert h5["peaks/id"].shape == (12,)
+        assert np.unique(h5["peaks/track"][:]).size == 2
+        assert h5["anchor_maps/roi_area"].shape == (12, 12)
+        features = h5["anchor_maps/roi_feature_log_squared"][:]
+        expected = relative_feature_similarity(features[:, None], features[None, :])
+        peak_frames = np.asarray(h5["peaks/frame_row"][:], int)
+        expected[peak_frames[:, None] == peak_frames[None, :]] = np.nan
+        np.testing.assert_allclose(
+            h5["anchor_maps/roi_area"][:], expected, equal_nan=True
+        )
+        assert np.all(
+            np.isnan(
+                h5["anchor_maps/location"][:][
+                    peak_frames[:, None] == peak_frames[None, :]
+                ]
+            )
+        )
+        assert not bool(h5.attrs["roi_area_directional"])
+        assert (
+            h5["anchor_maps/roi_feature_log_squared"].attrs["method"]
+            == "one_dimensional_radial_mean_approximation_of_raw_pixel_roi_feature"
+        )
+        assert bool(h5["peaks"].attrs["all_peak"])
+        assert not bool(h5["peaks"].attrs["track_used_for_grouping"])
+
+
+def test_missing_scientific_prerequisites_are_actionable(tmp_path):
+    analysis = _write_analysis(tmp_path / "analysis.h5", include_spots=False)
+    with pytest.raises(ValueError, match="spot tracking"):
+        run_correlations(
+            analysis,
+            tmp_path / "bad_single",
+            sample_type="single_crystal",
+            make_plots=False,
+        )
+
+    with h5py.File(str(analysis), "r+") as h5:
+        del h5["peaks"]
+    with pytest.raises(ValueError, match="Analysis Step 2"):
+        run_correlations(
+            analysis,
+            tmp_path / "bad_powder",
+            sample_type="powder",
+            make_plots=False,
+        )

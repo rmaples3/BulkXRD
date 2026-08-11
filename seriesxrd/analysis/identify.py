@@ -28,7 +28,6 @@ from __future__ import annotations
 import math
 import re
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -37,7 +36,7 @@ import numpy as np
 from .phases import (Phase, simulate_pattern, compression_at_pressure,
                      pymatgen_available, has_axial_eos, has_pressure_dof, axial_scales,
                      valid_pressure_max, thermal_scale)
-from .parallel import resolve_workers, chunk_ranges
+from .parallel import chunk_ranges, process_map_or_serial, resolve_workers
 from ..core.config import VERSION
 from ..core.provenance import manifest_provenance, write_step_provenance
 
@@ -178,6 +177,11 @@ def _simulate_one(phase: Phase, d_min: float, max_reflections: int):
             phase, d_min=d_min, max_reflections=max_reflections), None
     except Exception as e:                                # noqa: BLE001
         return phase.name, None, f"{type(e).__name__}: {e}"
+
+
+def _simulate_one_payload(payload):
+    """Unary adapter so reflection simulations use the shared safe map helper."""
+    return _simulate_one(*payload)
 
 
 def scale_at_pressure(phase: Phase, pressure: float) -> float:
@@ -961,30 +965,23 @@ def run_identification(
     # and results are keyed by name, so this changes timing only.
     refl_cache = {}
     t_sim = time.time()
+    simulation_payloads = [
+        (ph, sim_d_min, sim_max_refl) for ph in phases
+    ]
     if workers > 1 and len(phases) > 1:
-        try:
-            with ProcessPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_simulate_one, ph, sim_d_min, sim_max_refl):
-                        ph for ph in phases}
-                for fut in futs:
-                    name, refl, err = fut.result()
-                    if refl is not None:
-                        refl_cache[name] = refl
-                    else:
-                        print(f"[IDENTIFY] skipped {name!r}: simulation failed "
-                              f"({err})", flush=True)
-        except Exception as e:                      # pool unusable -> serial
-            print(f"[IDENTIFY] parallel simulation unavailable ({e}); "
-                  f"falling back to serial", flush=True)
-            refl_cache = {}
-    if not refl_cache:
-        for ph in phases:
-            try:
-                refl_cache[ph.name] = phase_reflections(
-                    ph, d_min=sim_d_min, max_reflections=sim_max_refl)
-            except Exception as e:
-                print(f"[IDENTIFY] skipped {ph.name!r}: simulation failed ({e})",
-                      flush=True)
+        simulation_results = process_map_or_serial(
+            _simulate_one_payload, simulation_payloads,
+            max_workers=workers, label="IDENTIFY")
+    else:
+        simulation_results = [
+            _simulate_one_payload(payload) for payload in simulation_payloads
+        ]
+    for name, refl, err in simulation_results:
+        if refl is not None:
+            refl_cache[name] = refl
+        else:
+            print(f"[IDENTIFY] skipped {name!r}: simulation failed ({err})",
+                  flush=True)
     kept = [ph for ph in phases if ph.name in refl_cache]
     print(f"[IDENTIFY] simulated {len(kept)}/{len(phases)} phases in "
           f"{time.time() - t_sim:.0f}s", flush=True)
@@ -1085,11 +1082,12 @@ def run_identification(
                      _slice(frame_temperature, a, b), intensity_k)
                     for a, b in ranges]
         done = 0
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            for (a, b), chunk_res in zip(ranges, ex.map(_identify_chunk, payloads)):
-                _absorb(a, chunk_res)
-                done += (b - a)
-                print(f"[IDENTIFY] {done} {n}", flush=True)
+        chunk_results = process_map_or_serial(
+            _identify_chunk, payloads, max_workers=workers, label="IDENTIFY")
+        for (a, b), chunk_res in zip(ranges, chunk_results):
+            _absorb(a, chunk_res)
+            done += (b - a)
+            print(f"[IDENTIFY] {done} {n}", flush=True)
     else:
         _absorb(0, _identify_chunk((phases, refls, obs_d_by_frame, excluded,
                                     prior_pressure, windows,

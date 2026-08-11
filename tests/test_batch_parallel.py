@@ -7,6 +7,7 @@ pymatgen (skipped when absent).
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -15,10 +16,50 @@ from seriesxrd.analysis.background import run_background_separation
 from seriesxrd.analysis.peaks import run_peak_fitting
 from seriesxrd.analysis import identify as idf
 from seriesxrd.analysis import batch
+from seriesxrd.analysis.parallel import process_map_or_serial
 
 
 def _gauss(x, c, a, w):
     return a * np.exp(-0.5 * ((x - c) / w) ** 2)
+
+
+def _double(value):
+    return 2 * value
+
+
+def _calculation_error(value):
+    raise ValueError(f"bad payload: {value}")
+
+
+class _SemaphoreDeniedPool:
+    """Stand-in for platforms that reject ProcessPool's semaphore creation."""
+
+    def __init__(self, *args, **kwargs):
+        raise PermissionError("semaphore creation denied")
+
+
+def test_process_map_permission_error_falls_back_in_order():
+    with patch(
+        "seriesxrd.analysis.parallel.ProcessPoolExecutor",
+        _SemaphoreDeniedPool,
+    ):
+        result = process_map_or_serial(
+            _double, [3, 1, 4], max_workers=2, label="TEST")
+    assert result == [6, 2, 8]
+
+
+def test_process_map_fallback_does_not_swallow_calculation_error():
+    with patch(
+        "seriesxrd.analysis.parallel.ProcessPoolExecutor",
+        _SemaphoreDeniedPool,
+    ):
+        try:
+            process_map_or_serial(
+                _calculation_error, [7, 8], max_workers=2, label="TEST")
+        except ValueError as exc:
+            assert str(exc) == "bad payload: 7"
+        else:
+            raise AssertionError("serial fallback swallowed the worker error")
 
 
 def _make_reduced(path, n=8, nb=1000, excluded_idx=(3,), noise=0.0):
@@ -84,7 +125,6 @@ def _counts(path):
 
 
 def test_peaks_excluded_atomic_and_parallel():
-    import h5py
     with tempfile.TemporaryDirectory() as td:
         red = Path(td) / "reduced.h5"
         _make_reduced(red, n=8, excluded_idx=(3,))

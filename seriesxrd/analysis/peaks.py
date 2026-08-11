@@ -34,13 +34,12 @@ drives a whole analysis HDF5 written by Step 1.
 """
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .parallel import resolve_workers, chunk_ranges
+from .parallel import chunk_ranges, process_map_or_serial, resolve_workers
 from ..core.config import VERSION
 from ..core.provenance import manifest_provenance, write_step_provenance
 
@@ -1342,11 +1341,13 @@ def run_peak_fitting(
         ]
         done = 0
         if workers > 1 and len(payloads) > 1:
-            with ProcessPoolExecutor(max_workers=workers) as ex:
-                for payload, result in zip(payloads, ex.map(_peaks_order_chunk, payloads)):
-                    _absorb_order(result)
-                    done += int(payload[3].size)
-                    print(f"[PEAKS] {done} {n}", flush=True)
+            results = process_map_or_serial(
+                _peaks_order_chunk, payloads,
+                max_workers=workers, label="PEAKS")
+            for payload, result in zip(payloads, results):
+                _absorb_order(result)
+                done += int(payload[3].size)
+                print(f"[PEAKS] {done} {n}", flush=True)
         else:
             for payload in payloads:
                 _absorb_order(_peaks_order_chunk(payload))
@@ -1361,11 +1362,12 @@ def run_peak_fitting(
                      bool(seed_axis_predictor and seed_axis_key != "frame"))
                     for a, b in ranges]
         done = 0
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            for (a, b), result in zip(ranges, ex.map(_peaks_chunk, payloads)):
-                _absorb(a, result)
-                done += (b - a)
-                print(f"[PEAKS] {done} {n}", flush=True)
+        results = process_map_or_serial(
+            _peaks_chunk, payloads, max_workers=workers, label="PEAKS")
+        for (a, b), result in zip(ranges, results):
+            _absorb(a, result)
+            done += (b - a)
+            print(f"[PEAKS] {done} {n}", flush=True)
     else:
         _absorb(0, _peaks_chunk((radial, clean, excluded, r_min_snr, window_factor,
                                  max_chi2, max_rel_misfit, propagate_seeds, r_prom,

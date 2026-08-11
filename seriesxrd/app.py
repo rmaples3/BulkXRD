@@ -1,8 +1,8 @@
 """Unified SeriesXRD desktop application.
 
-The application presents calibration, reduction, and analysis as one guided
-workflow. Tk imports remain deferred so the package can be imported and tested
-on headless systems.
+The application presents calibration, reduction, analysis, and correlations
+as one guided workflow. Tk imports remain deferred so the package can be
+imported and tested on headless systems.
 """
 from __future__ import annotations
 
@@ -18,10 +18,16 @@ from .core.config import (
 )
 from .reduce.session import seed_reduction_config
 from .analysis.session import seed_analysis_config
+from .correlations.session import seed_correlation_config
 from .guikit import theme
 
 DEFAULT_WORKSPACE = Path.home() / "seriesxrd_workspace"
-STAGE_TABS = ("1 Calibration", "2 Reduction", "3 Analysis")
+STAGE_TABS = (
+    "1 Calibration",
+    "2 Reduction",
+    "3 Analysis",
+    "4 Correlations",
+)
 REPO_URL = "https://github.com/RushMaples/SeriesXRD"
 
 
@@ -58,12 +64,14 @@ class SeriesXRDApp:
         from .calib.gui import make_calib_pane
         from .reduce.gui import make_reduce_pane
         from .analysis.gui import make_analysis_pane
+        from .correlations.gui import make_correlation_pane
 
         self.tk = tk
         self.workspace = ensure_dir(workspace)
         calib_cfg = _seed_calibration_config(self.workspace)
         reduce_cfg = seed_reduction_config(self.workspace)
         analysis_cfg = seed_analysis_config(self.workspace)
+        correlation_cfg = seed_correlation_config(self.workspace)
 
         self.root = tk.Tk()
         self.root.title(f"{TOOL_NAME} — {self.workspace.name}")
@@ -91,7 +99,8 @@ class SeriesXRDApp:
                 f"Workspace: {self.workspace}\nClick to copy the full path.")
         self._ws_label.bind("<Button-1>", lambda _e: self._copy_workspace_path())
         ttk.Label(
-            header, text="1  Calibrate   →   2  Reduce   →   3  Analyze",
+            header,
+            text="1  Calibrate   →   2  Reduce   →   3  Analyze   →   4  Correlate",
             style="Muted.TLabel",
         ).pack(side="right")
 
@@ -101,9 +110,11 @@ class SeriesXRDApp:
         calib_tab = ttk.Frame(self.nb)
         reduce_tab = ttk.Frame(self.nb)
         analysis_tab = ttk.Frame(self.nb)
+        correlation_tab = ttk.Frame(self.nb)
         self.nb.add(calib_tab, text=STAGE_TABS[0])
         self.nb.add(reduce_tab, text=STAGE_TABS[1])
         self.nb.add(analysis_tab, text=STAGE_TABS[2])
+        self.nb.add(correlation_tab, text=STAGE_TABS[3])
 
         self.calib_pane = make_calib_pane(calib_tab, calib_cfg)
         self.reduce_pane = make_reduce_pane(reduce_tab, reduce_cfg)
@@ -111,6 +122,10 @@ class SeriesXRDApp:
 
         self.analysis_pane = make_analysis_pane(analysis_tab, analysis_cfg)
         self.reduce_pane.add_reduced_listener(self._on_reduction_ready)
+
+        self.correlation_pane = make_correlation_pane(
+            correlation_tab, correlation_cfg)
+        self.analysis_pane.add_analysis_listener(self._on_analysis_ready)
 
         self._build_menubar()
         theme.register_widget_tree(self.root)
@@ -176,6 +191,19 @@ class SeriesXRDApp:
             label="Import GSAS-II sequential results…",
             command=self.analysis_pane.import_gsas_results_clicked)
         analysis_menu.add_command(label="View log", command=self.analysis_pane.open_console_logs)
+
+        correlation_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Correlations", menu=correlation_menu)
+        correlation_menu.add_command(
+            label="Use latest analysis",
+            command=self._handoff_analysis_to_correlations,
+        )
+        correlation_menu.add_command(
+            label="Run correlations", command=self.correlation_pane.run_clicked)
+        correlation_menu.add_command(
+            label="Review results", command=self.correlation_pane.review_results)
+        correlation_menu.add_command(
+            label="View log", command=self.correlation_pane.open_console_logs)
 
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
@@ -256,11 +284,17 @@ class SeriesXRDApp:
         self.analysis_pane.set_reduced(reduced_path)
         self._select_stage(2)
 
+    def _on_analysis_ready(self, analysis_path) -> None:
+        """Pass analyzed data forward and reveal the correlations stage."""
+        self.correlation_pane.set_analysis(analysis_path)
+        self._select_stage(3)
+
     def _save_all(self):
         try:
             self.calib_pane.save_config(silent=True)
             self.reduce_pane.save_config(silent=True)
             self.analysis_pane.save_config(silent=True)
+            self.correlation_pane.save_config(silent=True)
             self.calib_pane.log("Saved all configs")
         except Exception as e:
             self.calib_pane.log(f"Save all failed: {e!r}", "WARN")
@@ -277,6 +311,22 @@ class SeriesXRDApp:
                 "Reduction → Review tab) first.")
             return
         self._on_reduction_ready(reduced)
+
+    def _handoff_analysis_to_correlations(self):
+        """Push the latest Analysis HDF5 into the correlations pane."""
+        from tkinter import messagebox
+        self.analysis_pane.pull_vars()
+        analysis = str(
+            self.analysis_pane.config.get("analysis_h5_file", "") or ""
+        ).strip()
+        if not analysis or not Path(analysis).is_file():
+            messagebox.showinfo(
+                "No analysis output",
+                "No Analysis HDF5 is available yet. Run Analysis first, or "
+                "choose an existing Analysis HDF5 on the Correlations input page.",
+            )
+            return
+        self._on_analysis_ready(analysis)
 
     def _open_workspace(self):
         from tkinter import filedialog, messagebox
@@ -566,7 +616,12 @@ class SeriesXRDApp:
     # ------------------------------------------------------------------
 
     def _stage_panes(self):
-        return (self.calib_pane, self.reduce_pane, self.analysis_pane)
+        return (
+            self.calib_pane,
+            self.reduce_pane,
+            self.analysis_pane,
+            self.correlation_pane,
+        )
 
     def _confirm_shutdown_panes(self) -> bool:
         """Ask every stage before mutating any stage's lifecycle state."""

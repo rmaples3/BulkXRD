@@ -177,6 +177,107 @@ labelled data first.
                  pressure-ordered (azimuth, q) links with d0 and dd_dp.
 ```
 
+## Correlation HDF5 (`correlations/processing.py`)
+
+The fourth stage reads an Analysis HDF5 and writes
+`correlations_powder.h5` or `correlations_single_crystal.h5`; it never mutates
+the Analysis file. The matching manifests are `manifest_powder.json` and
+`manifest_single_crystal.json`. Both sample types can therefore share one
+result directory without overwriting each other's numerical artifacts. Let
+`M` be the retained frame count, `K` the retained all-peak/all-observation
+count, `R` the radial-bin count, `W` the window count, and `L=63` the
+positive-lag fingerprint length from each 64-point resampled window.
+
+```text
+/  attrs: tool, schema_version, seriesxrd_version, created_at, sample_type,
+          source_requested, source_resolved, source_analysis, unit,
+          n_frames, n_peaks, n_windows, all_peak_policy,
+          roi_area_method, roi_area_directional
+/provenance                         standard input identity + effective config
+/transform attrs: method="log_squared", scale, scale_quantile, noise_floor,
+          epsilon, epsilon_floor, formula, signed_formula,
+          position_in_pipeline, scale_estimate, noise_estimate
+
+/patterns/radial                   (R,)
+/patterns/original_positive        (M, R)  pre-Log² positive source; waterfall height
+/patterns/log_squared              (M, R)  positive-clipped bounded ROI source
+/patterns/log_squared_signed       (M, R)  signed-input bounded window source
+
+/frames/index                      (M,)    original Analysis frame indices
+/frames/filename                   (M,)    UTF-8
+/frames/pressure                   (M,)    GPa, NaN where unavailable
+
+/peaks/id                          (K,)    stage-local anchor id
+/peaks/source_index                (K,)    row in /peaks or /spots/obs
+/peaks/frame_row                   (K,)    row in this artifact's frame arrays
+/peaks/original_frame              (K,)    Analysis frame index
+/peaks/local_peak                  (K,)    deterministic slot within frame
+/peaks/center, width, half_width   (K,)    native radial unit
+/peaks/area, pressure, track       (K,)    upstream values/provenance
+
+/anchor_maps/profile_coordinate    (65,)   normalized review-sampling coordinate
+/anchor_maps/roi_profiles_log_squared (K, 65) review samples only
+/anchor_maps/roi_feature_log_squared  (K,) single-crystal runs only: 1D radial
+                                           mean approximation to the raw-pixel
+                                           Log² ROI feature
+/anchor_maps/roi_area              (K, K)  anchor-to-target similarity
+/anchor_maps/location              (K, K)  center similarity; no intensity transform
+
+/windows attrs: width, step                native radial unit; width <= selected span
+/windows/start, end                (W,)    native radial unit
+/windows/label                     (W,)    UTF-8
+/windows/acf_features              (M, W, L) standardized positive-lag FFT-ACF
+/windows/across_direct             (W, M, M) standardized transformed vectors
+/windows/across_acf                (W, M, M) standardized positive-lag FFT-ACF
+/windows/within_acf                (M, W, W) standardized positive-lag FFT-ACF
+```
+
+For powder, `half_width = 0.75 × width` and `/anchor_maps/roi_area`
+is a directional integrated IoU on the anchor's absolute native-radial
+support. The target is zero outside its own support; profiles are not
+recentered or width-normalized, so the matrix need not be symmetric. For
+single crystal, every `/spots/obs` row remains independent and the score is
+`min(feature_i, feature_j) / max(feature_i, feature_j)` (`both zero = 1`).
+The feature is a one-dimensional positive-Log² radial ROI approximation; it
+is not a raw-detector-pixel measurement. The track column is never used to
+group, filter, or score observations. In both sample modes, target peaks from
+the anchor's own frame are structural `NaN` cells and are blank in plots.
+
+ROI processing uses
+`clip(max(I, 0) / scale, 0, 1)` before squaring and applying the bounded Log²
+formula. Window processing uses signed background residuals normalized by the
+same pooled `scale` and `epsilon`, clips them to `[-1, 1]`, and then squares
+them inside the same Log² formula. FFT-ACF fingerprints are standardized,
+contain positive lags only, and exclude lag zero. The MVP does not write the
+prototype's `shift_tolerant_secondary` or same-scan aggregate because the
+Analysis HDF5 has no stable `scan_id`.
+
+Review images are replaceable artifacts beside the HDF5:
+
+```text
+heatmaps/<powder|single_crystal>/
+  roi_area/[pressure_*_GPa/]anchor_*.png
+  location/[pressure_*_GPa/]anchor_*.png
+  waterfall/[pressure_*_GPa/]anchor_*.png
+  window_across/direct/window_*.png
+  window_across/acf/window_*.png
+  window_within/acf/frame_*.png
+```
+
+Pressure subfolders are labels only and are created when finite pressure
+metadata exist. `manifest_<sample_type>.json` records the source, shared
+transform parameters, matrix counts, algorithms, and the exact current PNG
+list. Review images remain separated under `heatmaps/<sample_type>` when the
+result directory is shared.
+
+The arrays `/windows/across_direct`, `/windows/across_acf`, and
+`/windows/within_acf` retain their complete square matrices. Their PNG review
+views deliberately mask the diagonal and upper triangle, leaving only the
+strict lower triangle because the omitted values are self-correlations or
+mirrored duplicates. In the Results browser, across-frame images are filed
+under **All pressures**; within-frame images are filed under the corresponding
+frame pressure.
+
 ## JSON manifests
 
 Every stage run also returns/writes a JSON manifest whose header is

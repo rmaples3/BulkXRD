@@ -1,4 +1,4 @@
-"""SeriesXRD calibrates, reduces, and analyzes powder XRD series.
+"""SeriesXRD calibrates, reduces, analyzes, and correlates XRD series.
 
 The workflow is organized as one subpackage per pipeline stage, with shared
 infrastructure in `core` (session config, IO, naming, masks, env checks) and
