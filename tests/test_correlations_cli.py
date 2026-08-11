@@ -82,6 +82,47 @@ def test_cli_no_plots_really_writes_and_opens_h5(tmp_path):
     assert not any(".tmp" in path.name for path in out.iterdir())
 
 
+def test_cli_streams_progress_protocol(tmp_path, capsys):
+    """The run emits house-style 3-token '[CORRELATIONS] done total' lines."""
+    analysis = _write_minimal_analysis(tmp_path / "analysis.h5")
+    rc = main(
+        [
+            str(analysis),
+            "--out",
+            str(tmp_path / "out"),
+            "--sample-type",
+            "powder",
+            "--window-width",
+            "3",
+            "--window-step",
+            "2",
+            "--location-tolerance",
+            "0.2",
+            "--max-anchor-plots",
+            "1",
+        ]
+    )
+    assert rc == 0
+    progress = []
+    for line in capsys.readouterr().out.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "[CORRELATIONS]":
+            try:
+                progress.append((int(parts[1]), int(parts[2])))
+            except ValueError:
+                continue
+    assert progress, "no 3-token progress lines were streamed"
+    done, total = progress[-1]
+    assert done == total > 0
+    manifest = json.loads(
+        (tmp_path / "out" / "manifest_powder.json").read_text()
+    )
+    assert manifest["anchor_plot_cap"] == 1
+    assert len(
+        [f for f in manifest["plot_files"] if "anchor_" in f]
+    ) == 3
+
+
 def test_cli_missing_input_returns_one(tmp_path):
     rc = main(
         [

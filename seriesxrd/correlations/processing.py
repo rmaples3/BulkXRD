@@ -90,6 +90,11 @@ class PeakTable:
         return int(self.center.size)
 
 
+def _progress(done: int, total: int) -> None:
+    """House 3-token progress protocol; GUIs parse ``[CORRELATIONS] d t``."""
+    print(f"[CORRELATIONS] {int(done)} {int(total)}", flush=True)
+
+
 def _finite_positive(values: np.ndarray) -> np.ndarray:
     array = np.asarray(values, dtype=float)
     return array[np.isfinite(array) & (array > 0.0)]
@@ -828,7 +833,11 @@ def _powder_roi_matrix(
     # the overlap of the two supports voids that pair.
     target_bad_base = ~(support_ok & frame_usable[frame])
 
-    for i in np.nonzero(anchor_ok)[0]:
+    anchors_todo = np.nonzero(anchor_ok)[0]
+    chunk = max(1, anchors_todo.size // 20)
+    for done, i in enumerate(anchors_todo, start=1):
+        if done % chunk == 0 or done == anchors_todo.size:
+            _progress(done, anchors_todo.size)
         a_lo, a_hi = float(lo[i]), float(hi[i])
         s0 = int(np.searchsorted(x, a_lo, side="right"))
         s1 = int(np.searchsorted(x, a_hi, side="left"))
@@ -1169,6 +1178,7 @@ def run_correlations(
     location_tolerance: float = DEFAULT_LOCATION_TOLERANCE,
     scale_quantile: float = DEFAULT_SCALE_QUANTILE,
     make_plots: bool = True,
+    max_anchor_plots: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Generate the complete MVP correlation artifact and optional figures."""
 
@@ -1267,6 +1277,9 @@ def run_correlations(
         "location_tolerance": float(location_tolerance),
         "scale_quantile": float(scale_quantile),
         "make_plots": bool(make_plots),
+        "max_anchor_plots": (
+            None if max_anchor_plots is None else int(max_anchor_plots)
+        ),
     }
     h5_path = destination / f"correlations_{sample}.h5"
     _write_h5(
@@ -1298,7 +1311,11 @@ def run_correlations(
     if make_plots:
         from .plots import render_all
 
-        plot_files = render_all(h5_path, destination / "heatmaps")
+        plot_files = render_all(
+            h5_path,
+            destination / "heatmaps",
+            max_anchor_plots=max_anchor_plots,
+        )
     manifest = {
         **manifest_provenance(TOOL, SCHEMA_VERSION),
         "analysis_h5": str(analysis_path),
@@ -1337,6 +1354,9 @@ def run_correlations(
             "window_across_acf",
             "window_within_acf",
         ] + (["waterfall"] if make_plots else []),
+        "anchor_plot_cap": (
+            None if max_anchor_plots is None else int(max_anchor_plots)
+        ),
         "plots_written": len(plot_files),
         "plot_files": list(plot_files),
     }

@@ -117,3 +117,68 @@ def test_window_render_paths_use_triangle_mask_and_leave_h5_full(
         np.testing.assert_array_equal(h5["windows/across_direct"][:], stored[0])
         np.testing.assert_array_equal(h5["windows/across_acf"][:], stored[1])
         np.testing.assert_array_equal(h5["windows/within_acf"][:], stored[2])
+
+
+def test_waterfall_height_capped(tmp_path, monkeypatch):
+    """A many-frame series renders a bounded figure, not a 100-inch PNG."""
+    heights = []
+
+    def capture_save(fig, path):
+        heights.append(float(fig.get_size_inches()[1]))
+        fig.clear()
+
+    monkeypatch.setattr(plots, "_atomic_save", capture_save)
+    n_frames = 200
+    radial = np.linspace(1.0, 3.0, 50)
+    plots._waterfall(
+        tmp_path / "w.png",
+        radial=radial,
+        original_positive=np.ones((n_frames, radial.size)),
+        frame_indices=np.arange(n_frames),
+        frame_pressure=np.full(n_frames, np.nan),
+        peak_frame=np.asarray([0]),
+        centers=np.asarray([2.0]),
+        half_width=np.asarray([0.2]),
+        score=np.asarray([0.5]),
+        anchor=0,
+        unit="q_A^-1",
+    )
+    assert heights and heights[0] <= 18.0
+
+    # A small series keeps its full per-frame layout.
+    plots._waterfall(
+        tmp_path / "w2.png",
+        radial=radial,
+        original_positive=np.ones((6, radial.size)),
+        frame_indices=np.arange(6),
+        frame_pressure=np.full(6, np.nan),
+        peak_frame=np.asarray([0]),
+        centers=np.asarray([2.0]),
+        half_width=np.asarray([0.2]),
+        score=np.asarray([0.5]),
+        anchor=0,
+        unit="q_A^-1",
+    )
+    assert heights[1] == pytest.approx(0.55 * 6 + 2.2)
+
+
+def test_anchor_plot_cap_and_validity_skip(tmp_path):
+    """max_anchor_plots caps per-anchor PNGs deterministically; the HDF5
+    matrices stay complete."""
+    from tests.test_correlations_processing import _write_analysis
+    from seriesxrd.correlations.processing import run_correlations
+
+    analysis = _write_analysis(tmp_path / "analysis.h5")
+    manifest = run_correlations(
+        analysis,
+        tmp_path / "res",
+        sample_type="powder",
+        max_anchor_plots=2,
+    )
+    assert manifest["anchor_plot_cap"] == 2
+    per_anchor = [f for f in manifest["plot_files"] if "anchor_" in f]
+    assert len(per_anchor) == 3 * 2
+    named = {Path(f).name for f in per_anchor}
+    assert named == {"anchor_0000.png", "anchor_0001.png"}
+    with h5py.File(manifest["correlations_h5"], "r") as h5:
+        assert h5["anchor_maps/roi_area"].shape == (8, 8)

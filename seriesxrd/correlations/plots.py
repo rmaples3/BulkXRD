@@ -127,7 +127,13 @@ def _waterfall(
     from matplotlib.cm import ScalarMappable
 
     n_frames = original_positive.shape[0]
-    fig = Figure(figsize=(9.0, max(4.0, 0.55 * n_frames + 2.2)), facecolor="white")
+    # Cap the figure height: 0.55 in/frame is readable for tens of frames but
+    # a few hundred frames would render a 100+ inch, 15000+ px PNG.
+    height = min(max(4.0, 0.55 * n_frames + 2.2), 18.0)
+    label_stride = 1
+    if 0.55 * n_frames + 2.2 > 18.0:
+        label_stride = max(1, -(-n_frames // 40))
+    fig = Figure(figsize=(9.0, height), facecolor="white")
     FigureCanvasAgg(fig)
     ax = fig.add_subplot(111)
     cmap = colormaps["viridis"]
@@ -163,6 +169,8 @@ def _waterfall(
                 linewidth=0.0,
                 zorder=3,
             )
+        if frame % label_stride and frame != n_frames - 1:
+            continue
         pressure = frame_pressure[frame]
         label = (
             f"frame {int(frame_indices[frame])}, {pressure:g} GPa"
@@ -195,7 +203,11 @@ def _waterfall(
     _atomic_save(fig, path)
 
 
-def _render_into(correlations_h5: Path, base: Path) -> List[Path]:
+def _render_into(
+    correlations_h5: Path,
+    base: Path,
+    max_anchor_plots: "int | None" = None,
+) -> List[Path]:
     """Render one complete sample tree into an empty staging directory."""
 
     import h5py  # type: ignore
@@ -226,11 +238,30 @@ def _render_into(correlations_h5: Path, base: Path) -> List[Path]:
         across_acf = np.asarray(h5["windows/across_acf"][:], float)
         within_acf = np.asarray(h5["windows/within_acf"][:], float)
 
+    plot_anchor = anchor_valid.copy()
+    if max_anchor_plots is not None:
+        # Deterministic selection: the first N valid anchors in id order.
+        selected = np.nonzero(anchor_valid)[0][: max(int(max_anchor_plots), 0)]
+        plot_anchor = np.zeros_like(anchor_valid)
+        plot_anchor[selected] = True
+    n_selected = int(np.count_nonzero(plot_anchor))
+    planned = (
+        3 * n_selected
+        + across_direct.shape[0]
+        + across_acf.shape[0]
+        + within_acf.shape[0]
+    )
+
     files: List[Path] = []
+
+    def _tick() -> None:
+        if len(files) % 25 == 0 or len(files) == planned:
+            print(f"[CORRELATIONS] {len(files)} {planned}", flush=True)
+
     any_pressure = bool(np.any(np.isfinite(peak_pressure)))
     for kind, matrix in (("roi_area", roi), ("location", location)):
         for anchor in range(matrix.shape[0]):
-            if not anchor_valid[anchor]:
+            if not plot_anchor[anchor]:
                 continue
             folder = base / kind
             if any_pressure:
@@ -250,9 +281,10 @@ def _render_into(correlations_h5: Path, base: Path) -> List[Path]:
                 cmap="viridis",
             )
             files.append(path)
+            _tick()
 
     for anchor in range(roi.shape[0]):
-        if not anchor_valid[anchor]:
+        if not plot_anchor[anchor]:
             continue
         folder = base / "waterfall"
         if any_pressure:
@@ -272,6 +304,7 @@ def _render_into(correlations_h5: Path, base: Path) -> List[Path]:
             unit=unit,
         )
         files.append(path)
+        _tick()
 
     for label, matrices in (
         ("direct", across_direct),
@@ -298,6 +331,7 @@ def _render_into(correlations_h5: Path, base: Path) -> List[Path]:
                 cmap="coolwarm",
             )
             files.append(path)
+            _tick()
 
     for frame in range(within_acf.shape[0]):
         path = base / "window_within" / "acf" / f"frame_{int(frame_indices[frame]):04d}.png"
@@ -312,6 +346,7 @@ def _render_into(correlations_h5: Path, base: Path) -> List[Path]:
             cmap="coolwarm",
         )
         files.append(path)
+        _tick()
 
     return files
 
@@ -323,7 +358,12 @@ def _remove_exact_path(path: Path) -> None:
         path.unlink()
 
 
-def render_all(correlations_h5: str | Path, heatmap_root: str | Path) -> List[str]:
+def render_all(
+    correlations_h5: str | Path,
+    heatmap_root: str | Path,
+    *,
+    max_anchor_plots: "int | None" = None,
+) -> List[str]:
     """Render and replace one sample's managed heatmap tree.
 
     A complete tree is written beside the destination first. Only then is the
@@ -344,7 +384,7 @@ def render_all(correlations_h5: str | Path, heatmap_root: str | Path) -> List[st
     backup = root / f".{sample_type}.old-{os.getpid()}"
     _remove_exact_path(backup)
     try:
-        staged_files = _render_into(source, staging)
+        staged_files = _render_into(source, staging, max_anchor_plots)
         had_destination = destination.exists()
         if had_destination:
             os.replace(destination, backup)

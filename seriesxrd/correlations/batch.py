@@ -20,6 +20,7 @@ def _run(args: argparse.Namespace) -> int:
             location_tolerance=args.location_tol,
             scale_quantile=args.scale_quantile,
             make_plots=not args.no_plots,
+            max_anchor_plots=args.max_anchor_plots,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"[ERROR] correlation generation failed: {exc}", flush=True)
@@ -105,6 +106,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-plots",
         action="store_true",
         help="Write the sample-specific HDF5 and manifest only.",
+    )
+    parser.add_argument(
+        "--max-anchor-plots",
+        type=int,
+        default=None,
+        help=(
+            "Render per-anchor PNGs for at most this many valid anchors "
+            "(first N in id order); every matrix stays complete in the HDF5. "
+            "Default: no cap."
+        ),
     )
     return parser
 
