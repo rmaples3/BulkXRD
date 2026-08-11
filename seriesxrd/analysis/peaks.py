@@ -1341,6 +1341,7 @@ def run_peak_fitting(
         ]
         done = 0
         if workers > 1 and len(payloads) > 1:
+            # Lazy iterator: keeps the [PEAKS] progress lines streaming.
             results = process_map_or_serial(
                 _peaks_order_chunk, payloads,
                 max_workers=workers, label="PEAKS")
@@ -1362,6 +1363,7 @@ def run_peak_fitting(
                      bool(seed_axis_predictor and seed_axis_key != "frame"))
                     for a, b in ranges]
         done = 0
+        # Lazy iterator: keeps the [PEAKS] progress lines streaming.
         results = process_map_or_serial(
             _peaks_chunk, payloads, max_workers=workers, label="PEAKS")
         for (a, b), result in zip(ranges, results):

@@ -27,7 +27,14 @@ def _double(value):
     return 2 * value
 
 
-def _calculation_error(value):
+def _marker_then_error(payload):
+    """Record one execution per payload, then fail like a real worker bug.
+
+    A second line in a payload's marker file would prove the workload was
+    re-executed (the old serial-retry-on-worker-error behavior)."""
+    marker_dir, value = payload
+    with open(Path(marker_dir) / f"marker_{value}.txt", "a") as fh:
+        fh.write("ran\n")
     raise ValueError(f"bad payload: {value}")
 
 
@@ -38,28 +45,81 @@ class _SemaphoreDeniedPool:
         raise PermissionError("semaphore creation denied")
 
 
+class _SubmitDeniedPool:
+    """Pool that constructs but fails at submission (fork/spawn denied)."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def map(self, fn, items):
+        raise OSError("fork failed")
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        pass
+
+
+def _pool_available() -> bool:
+    from concurrent.futures import ProcessPoolExecutor
+    try:
+        with ProcessPoolExecutor(max_workers=2) as ex:
+            return list(ex.map(_double, [1])) == [2]
+    except OSError:
+        return False
+
+
 def test_process_map_permission_error_falls_back_in_order():
     with patch(
         "seriesxrd.analysis.parallel.ProcessPoolExecutor",
         _SemaphoreDeniedPool,
     ):
-        result = process_map_or_serial(
-            _double, [3, 1, 4], max_workers=2, label="TEST")
+        result = list(process_map_or_serial(
+            _double, [3, 1, 4], max_workers=2, label="TEST"))
+    assert result == [6, 2, 8]
+
+
+def test_process_map_submit_time_oserror_falls_back():
+    with patch(
+        "seriesxrd.analysis.parallel.ProcessPoolExecutor",
+        _SubmitDeniedPool,
+    ):
+        result = list(process_map_or_serial(
+            _double, [3, 1, 4], max_workers=2, label="TEST"))
     assert result == [6, 2, 8]
 
 
 def test_process_map_fallback_does_not_swallow_calculation_error():
-    with patch(
-        "seriesxrd.analysis.parallel.ProcessPoolExecutor",
-        _SemaphoreDeniedPool,
-    ):
+    """A worker error from a REAL pool propagates; nothing is re-run serially."""
+    import pytest
+    if not _pool_available():
+        pytest.skip("host cannot create a process pool")
+    with tempfile.TemporaryDirectory() as td:
+        payloads = [(td, 7), (td, 8)]
         try:
-            process_map_or_serial(
-                _calculation_error, [7, 8], max_workers=2, label="TEST")
+            list(process_map_or_serial(
+                _marker_then_error, payloads, max_workers=2, label="TEST"))
         except ValueError as exc:
             assert str(exc) == "bad payload: 7"
         else:
-            raise AssertionError("serial fallback swallowed the worker error")
+            raise AssertionError("worker error was swallowed")
+        for marker in Path(td).glob("marker_*.txt"):
+            runs = marker.read_text().count("ran")
+            assert runs == 1, f"{marker.name} executed {runs} times"
+
+
+def test_process_map_streams_results_lazily():
+    calls = []
+
+    def worker(value):
+        calls.append(value)
+        return 2 * value
+
+    gen = process_map_or_serial(worker, [1, 2, 3], max_workers=1, label="TEST")
+    assert iter(gen) is gen                      # a lazy iterator, not a list
+    assert calls == []                           # nothing ran before consumption
+    assert next(gen) == 2
+    assert calls == [1]                          # only the consumed payload ran
+    assert list(gen) == [4, 6]
+    assert calls == [1, 2, 3]
 
 
 def _make_reduced(path, n=8, nb=1000, excluded_idx=(3,), noise=0.0):

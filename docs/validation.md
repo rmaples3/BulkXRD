@@ -53,11 +53,16 @@ HDF5 provenance, and atomic output. The CLI test writes and reopens the
 sample-specific correlation HDF5 and renders PNGs with no display.
 
 **Restricted-host parallel fallback is tested explicitly.**
-`tests/test_batch_parallel.py` forces process-pool semaphore creation to raise
-`PermissionError` and verifies ordered serial fallback, while a separate test
-confirms that a real scientific calculation error is still raised rather than
-silently swallowed. The same helper covers background separation, peak
-fitting, phase simulation, and frame scoring.
+`tests/test_batch_parallel.py` covers both infrastructure-failure legs —
+process-pool semaphore creation raising `PermissionError` at construction, and
+an `OSError` at payload submission — and verifies the ordered serial fallback
+for each. A separate test runs a failing worker in a *real* process pool and
+verifies that the calculation error propagates with its own traceback and that
+no payload is silently re-executed serially. Results are yielded lazily in
+payload order, which is what keeps the `[ANALYSIS]`/`[PEAKS]`/`[IDENTIFY]`
+progress lines streaming during parallel runs; a further test pins that
+laziness. The same helper covers background separation, peak fitting, phase
+simulation, and frame scoring.
 
 ## Expected tolerances
 

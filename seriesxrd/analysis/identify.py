@@ -1082,6 +1082,7 @@ def run_identification(
                      _slice(frame_temperature, a, b), intensity_k)
                     for a, b in ranges]
         done = 0
+        # Lazy iterator: keeps the [IDENTIFY] progress lines streaming.
         chunk_results = process_map_or_serial(
             _identify_chunk, payloads, max_workers=workers, label="IDENTIFY")
         for (a, b), chunk_res in zip(ranges, chunk_results):

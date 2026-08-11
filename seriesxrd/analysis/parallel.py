@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ProcessPoolExecutor
-from typing import Callable, List, Sequence, Tuple, TypeVar
+from typing import Callable, Iterator, List, Sequence, Tuple, TypeVar
 
 
 _PayloadT = TypeVar("_PayloadT")
@@ -51,31 +51,51 @@ def process_map_or_serial(
     *,
     max_workers: int,
     label: str,
-) -> List[_ResultT]:
-    """Map independent payloads in processes, with an ordered serial fallback.
+) -> Iterator[_ResultT]:
+    """Map independent payloads in processes, yielding results in payload order.
 
-    Some restricted containers and Python builds cannot create the semaphore
-    used internally by :class:`~concurrent.futures.ProcessPoolExecutor`.  That
-    is an execution-environment limitation, not an analysis failure.  Materialize
-    the complete parallel result before returning it so a pool failure can never
-    leave a caller with a partially absorbed result, then repeat the *same*
-    payload sequence serially.
+    Results are yielded lazily as chunks complete, so callers that print
+    ``[LABEL] <done> <total>`` progress lines while absorbing keep streaming
+    them to the GUI instead of seeing everything arrive at once.
 
-    Worker exceptions are retried serially as well.  A genuine calculation
-    error is therefore raised by the serial call with its direct traceback;
-    only infrastructure failures disappear after a successful fallback.
+    Some restricted containers and Python builds cannot create the semaphores
+    and worker processes :class:`~concurrent.futures.ProcessPoolExecutor`
+    needs.  That is an execution-environment limitation, not an analysis
+    failure, and it surfaces as :class:`OSError` (including
+    :class:`PermissionError`) while the pool is being constructed or while the
+    payloads are being submitted -- before any result has been yielded.  Only
+    that failure falls back to the ordered serial loop.
+
+    Exceptions raised by ``worker`` itself, and a pool broken mid-run (a
+    worker process killed by a segfault or the OOM killer), propagate
+    unchanged: re-running a computation that just crashed natively inside the
+    parent process could take the whole session down with it.
     """
     items = list(payloads)
     if max_workers <= 1 or len(items) <= 1:
-        return [worker(payload) for payload in items]
+        for payload in items:
+            yield worker(payload)
+        return
 
+    executor = None
     try:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            return list(executor.map(worker, items))
-    except Exception as exc:
+        executor = ProcessPoolExecutor(max_workers=max_workers)
+        # Executor.map submits every payload eagerly, so fork/spawn failures
+        # land here rather than while the results are consumed below.
+        results = executor.map(worker, items)
+    except OSError as exc:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         print(
             f"[{label}] process pool unavailable "
             f"({type(exc).__name__}: {exc}); falling back to serial",
             flush=True,
         )
-        return [worker(payload) for payload in items]
+        for payload in items:
+            yield worker(payload)
+        return
+
+    try:
+        yield from results
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)

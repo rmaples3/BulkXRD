@@ -434,6 +434,8 @@ def run_background_separation(
         payloads = [(mean_all[a:b], robust_all[a:b], max_half_window, n_passes, use_lls)
                     for a, b in ranges]
         done = 0
+        # Lazy iterator: the [ANALYSIS] progress lines below stream only while
+        # results are consumed one chunk at a time -- do not materialize it.
         results = process_map_or_serial(
             _bg_chunk, payloads, max_workers=workers, label="ANALYSIS")
         for (a, b), (c, bs, sp, ct) in zip(ranges, results):
