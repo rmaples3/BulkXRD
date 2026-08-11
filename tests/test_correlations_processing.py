@@ -297,6 +297,140 @@ def test_roi_nan_policy_is_structural():
     assert np.all(np.isfinite(profiles[0][np.abs(grid - 2.0) > 0.1]))
 
 
+def test_vectorized_powder_matrix_matches_scalar_reference():
+    """The vectorized K x K matrix reproduces directional_anchor_iou exactly.
+
+    The fixture deliberately mixes on/off-grid supports, overlapping,
+    disjoint, nested, and edge-crossing supports, same-frame pairs, a masked
+    bin inside one frame, and a NaN bin outside every support (which the
+    scalar bridges via finite-subset interpolation)."""
+    from seriesxrd.correlations.processing import _powder_roi_matrix
+
+    rng = np.random.default_rng(11)
+    radial = np.linspace(0.0, 8.0, 161)
+    n_frames = 3
+    profiles = 0.2 + rng.random((n_frames, radial.size))
+    profiles[1, 40] = np.nan          # masked bin at radial 2.0 (frame 1)
+    profiles[2, 150] = np.nan         # masked bin at radial 7.5, outside supports
+
+    frame_row = np.asarray([0, 0, 1, 1, 2, 2, 0, 2])
+    center = np.asarray([1.0, 3.0, 2.0, 3.05, 1.0, 5.0, 0.05, 3.0])
+    half_width = np.asarray([0.4, 0.5, 0.3, 0.45, 0.4, 0.6, 0.2, 0.512])
+    size = center.size
+    peaks = PeakTable(
+        source_index=np.arange(size),
+        frame_row=frame_row,
+        original_frame=frame_row.copy(),
+        local_peak=np.zeros(size, int),
+        center=center,
+        width=half_width / 0.75,
+        half_width=half_width,
+        area=np.ones(size),
+        pressure=np.full(size, np.nan),
+        track=np.full(size, -1),
+    )
+
+    matrix = _powder_roi_matrix(radial, profiles, peaks)
+    reference = np.full((size, size), np.nan)
+    for i in range(size):
+        for j in range(size):
+            reference[i, j] = directional_anchor_iou(
+                radial,
+                profiles[frame_row[i]],
+                profiles[frame_row[j]],
+                anchor_support=(center[i] - half_width[i],
+                                center[i] + half_width[i]),
+                target_support=(center[j] - half_width[j],
+                                center[j] + half_width[j]),
+            )
+    assert np.allclose(matrix, reference, atol=1.0e-9, equal_nan=True)
+    # The fixture must actually exercise the interesting regimes.
+    assert np.all(np.isnan(reference[2]))            # masked-bin anchor row
+    assert np.all(np.isnan(reference[6]))            # edge-crossing anchor row
+    finite = np.isfinite(reference)
+    assert finite.sum() > 10
+    assert np.any(reference[finite] == 0.0)          # disjoint pairs present
+
+
+def test_batched_kernels_match_reference():
+    """Gram-matrix Pearson, batched ACF, and vectorized window resampling
+    agree with their scalar/loop references, including NaN and constant rows."""
+    from seriesxrd.correlations.processing import (
+        _acf,
+        _acf_batch,
+        _pairwise_correlations,
+        _pearson,
+        _resample_windows,
+    )
+
+    rng = np.random.default_rng(5)
+    rows = rng.normal(size=(6, 40))
+    rows[2, 7] = np.nan                     # invalid row
+    rows[3] = 1.25                          # constant row -> zero variance
+    rows[4] = rows[0]                       # perfectly correlated pair
+
+    pearson = _pairwise_correlations(rows)
+    for i in range(rows.shape[0]):
+        for j in range(rows.shape[0]):
+            expected = _pearson(rows[i], rows[j])
+            got = pearson[i, j]
+            assert (np.isnan(got) and np.isnan(expected)) or (
+                got == pytest.approx(expected, abs=1.0e-12)
+            )
+    assert pearson[0, 4] == pytest.approx(1.0)
+
+    acf = _acf_batch(rows)
+    for i in range(rows.shape[0]):
+        row = rows[i]
+        length = row.size - 1
+        expected = np.full(length, np.nan)
+        if np.all(np.isfinite(row)):
+            centered = row - np.mean(row)
+            scale = np.std(centered)
+            if scale > np.finfo(float).eps * max(np.max(np.abs(centered)), 1.0):
+                standardized = centered / scale
+                spectrum = np.fft.rfft(standardized, n=2 * row.size)
+                corr = np.fft.irfft(
+                    spectrum * np.conjugate(spectrum), n=2 * row.size
+                )[: row.size]
+                if corr[0] > np.finfo(float).eps:
+                    lags = corr[1:] / corr[0]
+                    lags = lags - np.mean(lags)
+                    fscale = np.std(lags)
+                    if fscale > 1.0e-12:
+                        expected = lags / fscale
+        assert np.allclose(acf[i], expected, atol=1.0e-9, equal_nan=True)
+        assert np.allclose(_acf(row), expected, atol=1.0e-9, equal_nan=True)
+
+    radial = np.linspace(0.0, 4.0, 81)
+    values = rng.normal(size=(4, radial.size))
+    values[1, 30] = np.nan
+    starts = np.asarray([0.0, 0.55, 1.9])
+    ends = starts + 2.0
+    resampled = _resample_windows(radial, values, starts, ends, points=33)
+    for w, (start, end) in enumerate(zip(starts, ends)):
+        grid = np.linspace(start, end, 33)
+        li = max(int(np.searchsorted(radial, start, side="right")) - 1, 0)
+        ri = min(int(np.searchsorted(radial, end, side="left")), radial.size - 1)
+        for f in range(values.shape[0]):
+            support = values[f, li : ri + 1]
+            if support.size < 2 or not np.all(np.isfinite(support)):
+                expected = np.full(33, np.nan)
+            else:
+                expected = np.interp(
+                    grid, radial[li : ri + 1], support,
+                    left=np.nan, right=np.nan,
+                )
+            assert np.allclose(
+                resampled[f, w], expected, atol=1.0e-12, equal_nan=True
+            )
+    # The masked frame is structurally voided exactly where the NaN bin
+    # falls inside the window support.
+    assert np.all(np.isnan(resampled[1, 0]))
+    assert np.all(np.isnan(resampled[1, 1]))
+    assert np.all(np.isfinite(resampled[1, 2]))
+
+
 def test_edge_anchor_flagged_and_unplotted(tmp_path):
     """A support crossing the radial boundary flags the anchor invalid,
     counts it in the manifest, and produces no per-anchor PNGs for it."""

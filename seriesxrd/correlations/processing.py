@@ -388,48 +388,78 @@ def _pearson(left: np.ndarray, right: np.ndarray) -> float:
 
 
 def _pairwise_correlations(rows: np.ndarray) -> np.ndarray:
+    """All-pairs Pearson matrix, matching :func:`_pearson` per cell.
+
+    One centered-rows Gram matrix replaces the O(n^2) Python loop; rows with
+    any non-finite value stay NaN everywhere, and a pair whose norm product
+    is not usable stays NaN, exactly as the scalar reference decides.
+    """
+
     values = np.asarray(rows, dtype=float)
     if values.ndim != 2:
         raise ValueError("correlation input must be a two-dimensional array")
-    count = values.shape[0]
+    count, length = values.shape
     result = np.full((count, count), np.nan, dtype=float)
-    for left in range(count):
-        for right in range(left, count):
-            score = _pearson(values[left], values[right])
-            result[left, right] = result[right, left] = score
+    if length < 2 or count == 0:
+        return result
+    finite = np.all(np.isfinite(values), axis=1)
+    if not np.any(finite):
+        return result
+    index = np.nonzero(finite)[0]
+    centered = values[index] - values[index].mean(axis=1, keepdims=True)
+    norms = np.linalg.norm(centered, axis=1)
+    gram = centered @ centered.T
+    denominator = norms[:, None] * norms[None, :]
+    bad_pair = ~np.isfinite(denominator) | (
+        denominator <= np.finfo(float).eps
+    )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        scores = np.clip(gram / denominator, -1.0, 1.0)
+    scores[bad_pair] = np.nan
+    result[np.ix_(index, index)] = scores
     return result
+
+
+def _acf_batch(rows: np.ndarray) -> np.ndarray:
+    """Row-batched :func:`_acf`: one FFT call along the last axis."""
+
+    values = np.asarray(rows, dtype=float)
+    if values.ndim != 2:
+        raise ValueError("ACF batch input must be a two-dimensional array")
+    count, size = values.shape
+    output = np.full((count, max(size - 1, 0)), np.nan, dtype=float)
+    if size < 3 or count == 0:
+        return output
+    eps = np.finfo(float).eps
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        ok = np.all(np.isfinite(values), axis=1)
+        centered = values - np.mean(values, axis=1, keepdims=True)
+        scale = np.std(centered, axis=1)
+        magnitude = np.maximum(np.max(np.abs(centered), axis=1), 1.0)
+        ok &= np.isfinite(scale) & (scale > eps * magnitude)
+        standardized = centered / np.where(ok, scale, 1.0)[:, None]
+        standardized = np.where(ok[:, None], standardized, 0.0)
+        spectrum = np.fft.rfft(standardized, n=2 * size, axis=1)
+        correlation = np.fft.irfft(
+            spectrum * np.conjugate(spectrum), n=2 * size, axis=1
+        )[:, :size]
+        zero_lag = correlation[:, 0]
+        ok &= np.isfinite(zero_lag) & (zero_lag > eps)
+        lags = correlation[:, 1:] / np.where(ok, zero_lag, 1.0)[:, None]
+        ok &= np.all(np.isfinite(lags) | ~ok[:, None], axis=1)
+        lags = lags - np.mean(lags, axis=1, keepdims=True)
+        fingerprint_scale = np.std(lags, axis=1)
+        ok &= np.isfinite(fingerprint_scale) & (fingerprint_scale > 1.0e-12)
+        lags = lags / np.where(ok, fingerprint_scale, 1.0)[:, None]
+    output[ok] = lags[ok]
+    return output
 
 
 def _acf(values: np.ndarray) -> np.ndarray:
     """Standardized full positive-lag autocorrelation fingerprint via FFT."""
 
     row = np.asarray(values, dtype=float).reshape(-1)
-    length = max(row.size - 1, 0)
-    invalid = np.full(length, np.nan, dtype=float)
-    if row.size < 3 or not np.all(np.isfinite(row)):
-        return invalid
-    row = row - float(np.mean(row))
-    signal_scale = float(np.std(row))
-    magnitude = max(float(np.max(np.abs(row))), 1.0)
-    if not np.isfinite(signal_scale) or signal_scale <= np.finfo(float).eps * magnitude:
-        return invalid
-    standardized_signal = row / signal_scale
-    count = standardized_signal.size
-    transformed = np.fft.rfft(standardized_signal, n=2 * count)
-    correlation = np.fft.irfft(
-        transformed * np.conjugate(transformed), n=2 * count
-    )[:count]
-    zero_lag = float(correlation[0])
-    if not np.isfinite(zero_lag) or zero_lag <= np.finfo(float).eps:
-        return invalid
-    positive_lags = np.asarray(correlation[1:] / zero_lag, dtype=float)
-    if not np.all(np.isfinite(positive_lags)):
-        return invalid
-    positive_lags -= float(np.mean(positive_lags))
-    fingerprint_scale = float(np.std(positive_lags))
-    if not np.isfinite(fingerprint_scale) or fingerprint_scale <= 1.0e-12:
-        return invalid
-    return positive_lags / fingerprint_scale
+    return _acf_batch(row[None, :])[0]
 
 
 def _window_bounds(
@@ -469,27 +499,32 @@ def _resample_windows(
 ) -> np.ndarray:
     frames = values.shape[0]
     output = np.full((frames, starts.size, int(points)), np.nan, dtype=float)
+    rows = np.asarray(values, dtype=float)
     for window, (start, end) in enumerate(zip(starts, ends, strict=True)):
         grid = np.linspace(float(start), float(end), int(points))
         left_index = max(int(np.searchsorted(radial, start, side="right")) - 1, 0)
         right_index = min(
             int(np.searchsorted(radial, end, side="left")), radial.size - 1
         )
-        for frame in range(frames):
-            support = np.asarray(
-                values[frame, left_index : right_index + 1], dtype=float
-            )
-            # A masked/native NaN bin is structural, not a value that the
-            # correlation stage may silently reconstruct by interpolation.
-            if support.size < 2 or not np.all(np.isfinite(support)):
-                continue
-            output[frame, window] = np.interp(
-                grid,
-                radial[left_index : right_index + 1],
-                support,
-                left=np.nan,
-                right=np.nan,
-            )
+        sub_x = radial[left_index : right_index + 1]
+        if sub_x.size < 2:
+            continue
+        # One interpolation-weight vector serves every frame of this window.
+        j = np.clip(
+            np.searchsorted(sub_x, grid, side="right") - 1, 0, sub_x.size - 2
+        )
+        weight = (grid - sub_x[j]) / (sub_x[j + 1] - sub_x[j])
+        sampled = (
+            rows[:, left_index + j] * (1.0 - weight)
+            + rows[:, left_index + j + 1] * weight
+        )
+        sampled[:, (grid < sub_x[0]) | (grid > sub_x[-1])] = np.nan
+        # A masked/native NaN bin is structural, not a value that the
+        # correlation stage may silently reconstruct by interpolation.
+        row_ok = np.all(
+            np.isfinite(rows[:, left_index : right_index + 1]), axis=1
+        )
+        output[row_ok, window] = sampled[row_ok]
     return output
 
 
@@ -508,13 +543,10 @@ def compute_window_correlations(
         raise ValueError("transformed patterns must have shape (frames, radial bins)")
     starts, ends = _window_bounds(x, float(window_width), float(window_step))
     signals = _resample_windows(x, y, starts, ends)
-    frames, windows, _ = signals.shape
-    acf_features = np.full(
-        (frames, windows, signals.shape[-1] - 1), np.nan, dtype=float
-    )
-    for frame in range(frames):
-        for window in range(windows):
-            acf_features[frame, window] = _acf(signals[frame, window])
+    frames, windows, points = signals.shape
+    acf_features = _acf_batch(
+        signals.reshape(frames * windows, points)
+    ).reshape(frames, windows, max(points - 1, 0))
 
     across_direct = np.full((windows, frames, frames), np.nan, dtype=float)
     across_acf = np.full_like(across_direct, np.nan)
@@ -740,20 +772,148 @@ def _powder_roi_matrix(
     transformed: np.ndarray,
     peaks: PeakTable,
 ) -> np.ndarray:
-    result = np.full((peaks.size, peaks.size), np.nan, dtype=float)
-    supports = np.column_stack(
-        (peaks.center - peaks.half_width, peaks.center + peaks.half_width)
+    """Vectorized K x K directional ROI matrix.
+
+    Reproduces :func:`directional_anchor_iou` cell for cell (the scalar stays
+    as the public reference and comparator): the same integration partition --
+    native bins inside the anchor support, the support boundaries, the
+    target-support cuts, and the min/max crossing points -- with every piece
+    integrated in closed form, evaluated for all K targets of one anchor in
+    a single vectorized pass instead of K^2 Python calls.
+    """
+
+    x = np.asarray(radial, dtype=float)
+    profiles = np.asarray(transformed, dtype=float)
+    count = peaks.size
+    result = np.full((count, count), np.nan, dtype=float)
+    if count == 0 or x.size < 2:
+        return result
+    lo = peaks.center - peaks.half_width
+    hi = peaks.center + peaks.half_width
+    frame = peaks.frame_row.astype(int)
+    eps = np.finfo(float).eps
+
+    finite = np.isfinite(profiles)
+    frame_usable = finite.sum(axis=1) >= 2
+    # The scalar interpolates every value over each frame's FINITE bins, so a
+    # NaN bin outside the structural-gate regions is bridged, not propagated.
+    # Pre-bridging each frame once reproduces that everywhere.
+    bridged = profiles.copy()
+    for row in np.nonzero(~finite.all(axis=1))[0]:
+        if frame_usable[row]:
+            bridged[row] = np.interp(x, x[finite[row]], profiles[row][finite[row]])
+    nonfinite_csum = np.zeros(
+        (profiles.shape[0], profiles.shape[1] + 1), dtype=np.int64
     )
-    for anchor in range(peaks.size):
-        anchor_profile = transformed[int(peaks.frame_row[anchor])]
-        for target in range(peaks.size):
-            result[anchor, target] = directional_anchor_iou(
-                radial,
-                anchor_profile,
-                transformed[int(peaks.frame_row[target])],
-                anchor_support=tuple(supports[anchor]),
-                target_support=tuple(supports[target]),
+    np.cumsum(~finite, axis=1, out=nonfinite_csum[:, 1:])
+
+    validity = _anchor_validity(x, profiles, peaks)
+    support_ok = np.isfinite(lo) & np.isfinite(hi) & (lo < hi)
+    anchor_ok = validity["valid"] & support_ok & frame_usable[frame]
+
+    # One (K, R) gather up front instead of one per anchor iteration.
+    target_rows = bridged[frame]
+
+    def _boundary_values(value: float) -> np.ndarray:
+        """Every peak's bridged frame profile interpolated at one value."""
+        base = int(np.clip(np.searchsorted(x, value, side="right") - 1,
+                           0, x.size - 2))
+        weight = (value - x[base]) / (x[base + 1] - x[base])
+        return (
+            target_rows[:, base] * (1.0 - weight)
+            + target_rows[:, base + 1] * weight
+        )
+
+    # Structural gate, target side: a non-finite native bin strictly inside
+    # the overlap of the two supports voids that pair.
+    target_bad_base = ~(support_ok & frame_usable[frame])
+
+    for i in np.nonzero(anchor_ok)[0]:
+        a_lo, a_hi = float(lo[i]), float(hi[i])
+        s0 = int(np.searchsorted(x, a_lo, side="right"))
+        s1 = int(np.searchsorted(x, a_hi, side="left"))
+        grid = np.concatenate(([a_lo], x[s0:s1], [a_hi]))
+        left = grid[:-1]
+        right = grid[1:]
+        width_all = right - left
+        boundary_lo = _boundary_values(a_lo)
+        boundary_hi = _boundary_values(a_hi)
+        a_raw = np.empty(grid.size)
+        a_raw[0] = boundary_lo[i]
+        a_raw[-1] = boundary_hi[i]
+        a_raw[1:-1] = bridged[frame[i], s0:s1]
+        t_raw = np.empty((count, grid.size))
+        t_raw[:, 0] = boundary_lo
+        t_raw[:, -1] = boundary_hi
+        t_raw[:, 1:-1] = target_rows[:, s0:s1]
+
+        a0, a1 = a_raw[:-1], a_raw[1:]
+        clip_a0 = np.clip(a0, 0.0, None)
+        clip_a1 = np.clip(a1, 0.0, None)
+        t0, t1 = t_raw[:, :-1], t_raw[:, 1:]
+        cut1 = np.clip(lo[:, None], left, right)
+        cut2 = np.clip(hi[:, None], left, right)
+        frac1 = (cut1 - left) / width_all
+        frac2 = (cut2 - left) / width_all
+        # Raw linear values at the cut points, then clip -- the scalar samples
+        # clip(raw interpolant) at every knot it integrates between.
+        a_cut1 = np.clip(a0 + frac1 * (a1 - a0), 0.0, None)
+        a_cut2 = np.clip(a0 + frac2 * (a1 - a0), 0.0, None)
+        t_cut1 = np.clip(t0 + frac1 * (t1 - t0), 0.0, None)
+        t_cut2 = np.clip(t0 + frac2 * (t1 - t0), 0.0, None)
+        # Outside the target support T = 0: min contributes nothing (A >= 0),
+        # max integrates the anchor alone.
+        den_zero = (
+            (clip_a0[None, :] + a_cut1) * 0.5 * (cut1 - left)
+            + (a_cut2 + clip_a1[None, :]) * 0.5 * (right - cut2)
+        )
+        overlap_width = cut2 - cut1
+        diff0 = a_cut1 - t_cut1
+        diff1 = a_cut2 - t_cut2
+        min0 = np.minimum(a_cut1, t_cut1)
+        min1 = np.minimum(a_cut2, t_cut2)
+        max0 = np.maximum(a_cut1, t_cut1)
+        max1 = np.maximum(a_cut2, t_cut2)
+        crossing = (diff0 * diff1) < 0.0
+        cross_frac = np.where(
+            crossing, -diff0 / np.where(crossing, diff1 - diff0, 1.0), 0.0
+        )
+        value_at_cross = a_cut1 + cross_frac * (a_cut2 - a_cut1)
+        num_mid = np.where(
+            crossing,
+            (min0 + value_at_cross) * 0.5 * cross_frac * overlap_width
+            + (value_at_cross + min1) * 0.5 * (1.0 - cross_frac) * overlap_width,
+            (min0 + min1) * 0.5 * overlap_width,
+        )
+        den_mid = np.where(
+            crossing,
+            (max0 + value_at_cross) * 0.5 * cross_frac * overlap_width
+            + (value_at_cross + max1) * 0.5 * (1.0 - cross_frac) * overlap_width,
+            (max0 + max1) * 0.5 * overlap_width,
+        )
+        empty = overlap_width <= 0.0
+        num = np.where(empty, 0.0, num_mid).sum(axis=1)
+        den = (den_zero + np.where(empty, 0.0, den_mid)).sum(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            score = np.where(
+                den <= eps, 0.0, np.clip(num / den, 0.0, 1.0)
             )
+
+        overlap_lo = np.maximum(a_lo, lo)
+        overlap_hi = np.minimum(a_hi, hi)
+        has_overlap = overlap_lo < overlap_hi
+        gate_left = np.searchsorted(x, overlap_lo, side="right")
+        gate_right = np.maximum(
+            np.searchsorted(x, overlap_hi, side="left"), gate_left
+        )
+        masked_overlap = np.zeros(count, dtype=bool)
+        rows_with = np.nonzero(has_overlap)[0]
+        masked_overlap[rows_with] = (
+            nonfinite_csum[frame[rows_with], gate_right[rows_with]]
+            - nonfinite_csum[frame[rows_with], gate_left[rows_with]]
+        ) > 0
+        score[target_bad_base | masked_overlap] = np.nan
+        result[i] = score
     return result
 
 
@@ -768,14 +928,12 @@ def _single_roi_features(
     """
 
     profiles = np.asarray(roi_profiles, dtype=float)
-    features = np.full(profiles.shape[0], np.nan, dtype=float)
-    for index, profile in enumerate(profiles):
-        finite = np.isfinite(profile)
-        if np.count_nonzero(finite) >= 2:
-            features[index] = float(
-                np.mean(np.clip(profile[finite], 0.0, None))
-            )
-    return features
+    finite = np.isfinite(profiles)
+    counts = finite.sum(axis=1)
+    clipped = np.where(finite, np.clip(profiles, 0.0, None), 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        means = clipped.sum(axis=1) / counts
+    return np.where(counts >= 2, means, np.nan)
 
 
 def _single_roi_matrix(features: np.ndarray) -> np.ndarray:
