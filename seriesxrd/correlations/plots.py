@@ -215,6 +215,11 @@ def _render_into(correlations_h5: Path, base: Path) -> List[Path]:
         half_width = np.asarray(h5["peaks/half_width"][:], float)
         roi = np.asarray(h5["anchor_maps/roi_area"][:], float)
         location = np.asarray(h5["anchor_maps/location"][:], float)
+        # Artifacts written before /peaks/valid existed plot every anchor.
+        if "peaks/valid" in h5:
+            anchor_valid = np.asarray(h5["peaks/valid"][:], bool)
+        else:
+            anchor_valid = np.ones(peak_frame.size, dtype=bool)
         starts = np.asarray(h5["windows/start"][:], float)
         ends = np.asarray(h5["windows/end"][:], float)
         across_direct = np.asarray(h5["windows/across_direct"][:], float)
@@ -225,6 +230,8 @@ def _render_into(correlations_h5: Path, base: Path) -> List[Path]:
     any_pressure = bool(np.any(np.isfinite(peak_pressure)))
     for kind, matrix in (("roi_area", roi), ("location", location)):
         for anchor in range(matrix.shape[0]):
+            if not anchor_valid[anchor]:
+                continue
             folder = base / kind
             if any_pressure:
                 folder = folder / _safe_pressure(float(peak_pressure[anchor]))
@@ -245,6 +252,8 @@ def _render_into(correlations_h5: Path, base: Path) -> List[Path]:
             files.append(path)
 
     for anchor in range(roi.shape[0]):
+        if not anchor_valid[anchor]:
+            continue
         folder = base / "waterfall"
         if any_pressure:
             folder = folder / _safe_pressure(float(peak_pressure[anchor]))

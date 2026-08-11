@@ -41,6 +41,12 @@ def inspect_correlations(path: str | Path) -> Dict[str, Any]:
                     "n_windows": int(h5.attrs.get("n_windows", 0)),
                 }
             )
+            # Absent on artifacts written before /peaks/valid existed --
+            # never an anomaly.
+            if "peaks/valid" in h5:
+                result["n_anchors_valid"] = int(
+                    np.count_nonzero(np.asarray(h5["peaks/valid"][:], bool))
+                )
             required = (
                 "patterns/original_positive",
                 "patterns/log_squared",

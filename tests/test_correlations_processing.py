@@ -26,12 +26,21 @@ def _gaussian(x, center, width, amplitude):
     return amplitude * np.exp(-0.5 * ((x - center) / width) ** 2)
 
 
-def _write_analysis(path: Path, *, include_spots: bool = True) -> Path:
+def _write_analysis(
+    path: Path,
+    *,
+    include_spots: bool = True,
+    excluded_idx: tuple = (),
+    edge_peak: bool = False,
+) -> Path:
     radial = np.linspace(0.0, 10.0, 241)
     n_frames = 4
     clean = np.zeros((n_frames, radial.size), dtype=float)
     peak_rows = []
     spot_rows = []
+    if edge_peak:
+        # Center inside the axis but ROI support [-0.2, 0.4] crossing radial[0].
+        peak_rows.append((0, 0.1, 0.4, 2.0))
     for frame in range(n_frames):
         shift = 0.03 * frame
         clean[frame] = (
@@ -76,7 +85,10 @@ def _write_analysis(path: Path, *, include_spots: bool = True) -> Path:
             dtype=h5py.string_dtype("utf-8"),
         )
         frames.create_dataset("pressure", data=np.asarray([1.0, 1.0, 5.0, 5.0]))
-        frames.create_dataset("excluded", data=np.zeros(n_frames, bool))
+        excluded = np.zeros(n_frames, bool)
+        for index in excluded_idx:
+            excluded[index] = True
+        frames.create_dataset("excluded", data=excluded)
 
         peaks = h5.create_group("peaks")
         peaks.attrs["source"] = "clean"
@@ -283,6 +295,86 @@ def test_roi_nan_policy_is_structural():
     near_masked = np.abs(grid - 2.0) < 0.02
     assert np.all(np.isnan(profiles[0][near_masked]))
     assert np.all(np.isfinite(profiles[0][np.abs(grid - 2.0) > 0.1]))
+
+
+def test_edge_anchor_flagged_and_unplotted(tmp_path):
+    """A support crossing the radial boundary flags the anchor invalid,
+    counts it in the manifest, and produces no per-anchor PNGs for it."""
+    from seriesxrd.correlations.plots import render_all
+
+    analysis = _write_analysis(tmp_path / "analysis.h5", edge_peak=True)
+    out = tmp_path / "res"
+    manifest = run_correlations(
+        analysis, out, sample_type="powder", make_plots=False
+    )
+    assert manifest["n_peaks"] == 9
+    assert manifest["n_anchors_valid"] == 8
+    assert manifest["n_anchors_edge"] == 1
+    assert manifest["n_anchors_masked"] == 0
+
+    h5_path = Path(manifest["correlations_h5"])
+    with h5py.File(str(h5_path), "r") as h5:
+        valid = np.asarray(h5["peaks/valid"][:], bool)
+        centers = np.asarray(h5["peaks/center"][:], float)
+        roi = np.asarray(h5["anchor_maps/roi_area"][:], float)
+    assert valid.sum() == 8
+    edge = np.nonzero(~valid)[0]
+    assert centers[edge] == pytest.approx([0.1])
+    # The invalid anchor's whole score row is structurally NaN.
+    assert np.all(np.isnan(roi[edge[0]]))
+
+    files = render_all(h5_path, out / "heatmaps")
+    names = {Path(f).name for f in files}
+    assert f"anchor_{int(edge[0]):04d}.png" not in names
+    # Valid anchors still get all three per-anchor plots.
+    per_anchor = [f for f in files if "anchor_" in f]
+    assert len(per_anchor) == 3 * 8
+
+    # An artifact written without /peaks/valid still renders and inspects.
+    with h5py.File(str(h5_path), "r+") as h5:
+        del h5["peaks/valid"]
+    legacy = inspect_correlations(h5_path)
+    assert legacy["ok"]
+    assert "n_anchors_valid" not in legacy
+    legacy_files = render_all(h5_path, out / "heatmaps_legacy")
+    assert len([f for f in legacy_files if "anchor_" in f]) == 3 * 9
+
+
+def test_excluded_frames_remap_peak_rows(tmp_path):
+    """Excluding a frame drops its patterns AND remaps every peak's frame_row."""
+    analysis = _write_analysis(tmp_path / "analysis.h5", excluded_idx=(1,))
+    out = tmp_path / "res"
+    manifest = run_correlations(
+        analysis, out, sample_type="powder", make_plots=False
+    )
+    assert manifest["n_frames"] == 3
+    assert manifest["n_excluded_frames"] == 1
+    assert manifest["n_peaks"] == 6            # 2 per kept frame
+
+    with h5py.File(str(analysis), "r") as src:
+        clean = np.asarray(src["background/clean"][:], float)
+    with h5py.File(str(manifest["correlations_h5"]), "r") as h5:
+        index = np.asarray(h5["frames/index"][:], int)
+        frame_row = np.asarray(h5["peaks/frame_row"][:], int)
+        original_frame = np.asarray(h5["peaks/original_frame"][:], int)
+        centers = np.asarray(h5["peaks/center"][:], float)
+        original_positive = np.asarray(
+            h5["patterns/original_positive"][:], float
+        )
+    assert index.tolist() == [0, 2, 3]
+    assert 1 not in original_frame.tolist()
+    # frame_row indexes the compacted frame axis and round-trips through it.
+    assert np.array_equal(original_frame, index[frame_row])
+    # Pattern rows are exactly the kept source rows (positive-clipped).
+    expected = np.where(
+        np.isfinite(clean[index]), np.clip(clean[index], 0.0, None), np.nan
+    )
+    assert np.allclose(original_positive, expected, equal_nan=True)
+    # Each kept frame's peaks sit at that frame's true shifted centers.
+    for row, frame in enumerate(index):
+        shift = 0.03 * frame
+        got = np.sort(centers[frame_row == row])
+        assert got == pytest.approx([2.0 + shift, 6.0 - shift])
 
 
 def test_powder_end_to_end_writes_atomic_schema_and_manifest(tmp_path):

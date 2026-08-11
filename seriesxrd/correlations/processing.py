@@ -702,6 +702,39 @@ def _roi_profiles(
     return coordinate, profiles
 
 
+def _anchor_validity(
+    radial: np.ndarray,
+    transformed: np.ndarray,
+    peaks: PeakTable,
+) -> Dict[str, np.ndarray]:
+    """Which anchors' ROI supports the scoring kernels can actually use.
+
+    ``edge`` anchors have a support crossing the radial boundary; ``masked``
+    anchors have a non-finite native bin strictly inside their own support.
+    Either condition makes the whole anchor row structurally NaN, so such
+    anchors are flagged (and their per-anchor plots skipped) instead of
+    silently producing empty maps.
+    """
+
+    lo = peaks.center - peaks.half_width
+    hi = peaks.center + peaks.half_width
+    in_bounds = (lo >= radial[0]) & (hi <= radial[-1])
+    nonfinite = ~np.isfinite(np.asarray(transformed, dtype=float))
+    csum = np.zeros(
+        (nonfinite.shape[0], nonfinite.shape[1] + 1), dtype=np.int64
+    )
+    np.cumsum(nonfinite, axis=1, out=csum[:, 1:])
+    left = np.searchsorted(radial, lo, side="right")
+    right = np.maximum(np.searchsorted(radial, hi, side="left"), left)
+    rows = peaks.frame_row.astype(int)
+    interior_bad = (csum[rows, right] - csum[rows, left]) > 0
+    return {
+        "valid": in_bounds & ~interior_bad,
+        "edge": ~in_bounds,
+        "masked": in_bounds & interior_bad,
+    }
+
+
 def _powder_roi_matrix(
     radial: np.ndarray,
     transformed: np.ndarray,
@@ -791,6 +824,7 @@ def _write_h5(
     transform: TransformParameters,
     frames: Mapping[str, Any],
     peaks: PeakTable,
+    peak_valid: np.ndarray,
     profile_coordinate: np.ndarray,
     roi_profiles: np.ndarray,
     roi_feature: Optional[np.ndarray],
@@ -884,6 +918,12 @@ def _write_h5(
                 "track",
             ):
                 _create_dataset(peak_group, name, getattr(peaks, name))
+            _create_dataset(peak_group, "valid", np.asarray(peak_valid, bool))
+            peak_group["valid"].attrs["meaning"] = (
+                "ROI support lies inside the radial axis with no masked native "
+                "bin inside it; an invalid anchor's score row is structurally "
+                "NaN and its per-anchor plots are skipped"
+            )
             peak_group.attrs["all_peak"] = True
             peak_group.attrs["track_used_for_grouping"] = False
 
@@ -1028,6 +1068,7 @@ def run_correlations(
         patterns, scale_quantile=float(scale_quantile)
     )
     transformed_signed = _signed_log_squared_transform(patterns, transform)
+    validity = _anchor_validity(radial, transformed_positive, peaks)
     profile_coordinate, roi_profiles = _roi_profiles(
         radial, transformed_positive, peaks
     )
@@ -1084,6 +1125,7 @@ def run_correlations(
         transform=transform,
         frames=frames,
         peaks=peaks,
+        peak_valid=validity["valid"],
         profile_coordinate=profile_coordinate,
         roi_profiles=roi_profiles,
         roi_feature=roi_feature,
@@ -1113,6 +1155,9 @@ def run_correlations(
         "n_frames": int(original_positive.shape[0]),
         "n_excluded_frames": int(frames["excluded_count"]),
         "n_peaks": int(peaks.size),
+        "n_anchors_valid": int(np.count_nonzero(validity["valid"])),
+        "n_anchors_edge": int(np.count_nonzero(validity["edge"])),
+        "n_anchors_masked": int(np.count_nonzero(validity["masked"])),
         "n_windows": int(windows["start"].size),
         "all_peak": True,
         "track_collapsed": False,
