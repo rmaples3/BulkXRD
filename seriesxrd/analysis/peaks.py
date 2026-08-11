@@ -1217,12 +1217,12 @@ def run_peak_fitting(
             seed_axis_values = np.arange(clean_raw.shape[0], dtype=float)
             seed_group_values = np.zeros(clean_raw.shape[0], dtype=int)
             if seed_axis_key != "frame" or seed_group_key != "none":
-                from .unknowns import _tracking_groups, _tracking_values
+                from .series import tracking_groups, tracking_values
                 if seed_axis_key != "frame":
-                    seed_axis_key, seed_axis_values, _ = _tracking_values(
+                    seed_axis_key, seed_axis_values, _ = tracking_values(
                         h5, seed_axis_key, clean_raw.shape[0])
                 if seed_group_key != "none":
-                    seed_group_key, seed_group_values, seed_group_labels = _tracking_groups(
+                    seed_group_key, seed_group_values, seed_group_labels = tracking_groups(
                         h5, seed_group_key, clean_raw.shape[0])
 
     # Pick the channel to fit on. "auto" is DATA-driven: when Step 1 diagnosed a

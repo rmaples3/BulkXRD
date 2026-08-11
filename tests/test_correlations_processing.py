@@ -32,6 +32,7 @@ def _write_analysis(
     include_spots: bool = True,
     excluded_idx: tuple = (),
     edge_peak: bool = False,
+    pressures: "tuple | None" = None,
 ) -> Path:
     radial = np.linspace(0.0, 10.0, 241)
     n_frames = 4
@@ -84,7 +85,10 @@ def _write_analysis(
             data=np.asarray([f"scan_{i:03d}.tif" for i in range(n_frames)], object),
             dtype=h5py.string_dtype("utf-8"),
         )
-        frames.create_dataset("pressure", data=np.asarray([1.0, 1.0, 5.0, 5.0]))
+        frame_pressures = np.asarray(
+            [1.0, 1.0, 5.0, 5.0] if pressures is None else pressures, float
+        )
+        frames.create_dataset("pressure", data=frame_pressures)
         excluded = np.zeros(n_frames, bool)
         for index in excluded_idx:
             excluded[index] = True
@@ -295,6 +299,59 @@ def test_roi_nan_policy_is_structural():
     near_masked = np.abs(grid - 2.0) < 0.02
     assert np.all(np.isnan(profiles[0][near_masked]))
     assert np.all(np.isfinite(profiles[0][np.abs(grid - 2.0) > 0.1]))
+
+
+def test_order_by_pressure_reorders_frames_and_peaks(tmp_path):
+    """--order-by pressure permutes frames, patterns, and peak frame_rows
+    coherently; the default keeps Analysis file order byte-identically."""
+    analysis = _write_analysis(
+        tmp_path / "analysis.h5", pressures=(5.0, 1.0, 5.0, 1.0)
+    )
+    default = run_correlations(
+        analysis, tmp_path / "default", sample_type="powder", make_plots=False
+    )
+    ordered = run_correlations(
+        analysis, tmp_path / "ordered", sample_type="powder",
+        make_plots=False, order_by="pressure",
+    )
+    assert default["order_by"] == "frame"
+    assert ordered["order_by"] == "pressure"
+    assert ordered["order_label"] == "Pressure (GPa)"
+
+    with h5py.File(default["correlations_h5"], "r") as h5:
+        assert np.asarray(h5["frames/index"][:]).tolist() == [0, 1, 2, 3]
+        assert np.asarray(h5["frames/order_value"][:]).tolist() == [0, 1, 2, 3]
+
+    with h5py.File(analysis, "r") as src:
+        clean = np.asarray(src["background/clean"][:], float)
+    with h5py.File(ordered["correlations_h5"], "r") as h5:
+        assert h5.attrs["order_by"] == "pressure"
+        index = np.asarray(h5["frames/index"][:], int)
+        # Ascending pressure, original order as tie-break: 1 GPa frames first.
+        assert index.tolist() == [1, 3, 0, 2]
+        assert np.asarray(h5["frames/order_value"][:]).tolist() == [
+            1.0, 1.0, 5.0, 5.0,
+        ]
+        assert np.asarray(h5["frames/pressure"][:]).tolist() == [
+            1.0, 1.0, 5.0, 5.0,
+        ]
+        frame_row = np.asarray(h5["peaks/frame_row"][:], int)
+        original_frame = np.asarray(h5["peaks/original_frame"][:], int)
+        centers = np.asarray(h5["peaks/center"][:], float)
+        original_positive = np.asarray(
+            h5["patterns/original_positive"][:], float
+        )
+    # Pattern rows follow the permutation.
+    expected = np.where(
+        np.isfinite(clean[index]), np.clip(clean[index], 0.0, None), np.nan
+    )
+    assert np.allclose(original_positive, expected, equal_nan=True)
+    # Peaks stay attached to their frames through the permutation.
+    assert np.array_equal(original_frame, index[frame_row])
+    for row, frame in enumerate(index):
+        shift = 0.03 * frame
+        got = np.sort(centers[frame_row == row])
+        assert got == pytest.approx([2.0 + shift, 6.0 - shift])
 
 
 def test_vectorized_powder_matrix_matches_scalar_reference():

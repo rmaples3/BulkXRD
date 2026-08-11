@@ -21,6 +21,7 @@ def _run(args: argparse.Namespace) -> int:
             scale_quantile=args.scale_quantile,
             make_plots=not args.no_plots,
             max_anchor_plots=args.max_anchor_plots,
+            order_by=args.order_by,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"[ERROR] correlation generation failed: {exc}", flush=True)
@@ -106,6 +107,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-plots",
         action="store_true",
         help="Write the sample-specific HDF5 and manifest only.",
+    )
+    parser.add_argument(
+        "--order-by",
+        default="frame",
+        choices=("frame", "pressure", "temperature", "time"),
+        help=(
+            "Order retained frames by this /frames metadata axis before "
+            "correlating (default: the Analysis file order)."
+        ),
     )
     parser.add_argument(
         "--max-anchor-plots",

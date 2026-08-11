@@ -573,7 +573,7 @@ def compute_window_correlations(
     }
 
 
-def _read_frames(h5, n_frames: int) -> Dict[str, Any]:
+def _read_frames(h5, n_frames: int, order_by: str = "frame") -> Dict[str, Any]:
     frames = h5.get("frames")
     names = [f"frame_{index:04d}" for index in range(n_frames)]
     pressure = np.full(n_frames, np.nan, dtype=float)
@@ -595,7 +595,20 @@ def _read_frames(h5, n_frames: int) -> Dict[str, Any]:
     keep = ~excluded
     if not np.any(keep):
         raise ValueError("all analysis frames are excluded")
+
+    from ..analysis.series import tracking_values
+
+    axis_key, axis_values, axis_label = tracking_values(h5, order_by, n_frames)
     original_index = np.nonzero(keep)[0].astype(np.int32)
+    order_values = np.asarray(axis_values, dtype=float)[original_index]
+    if axis_key != "frame":
+        # Stable physical ordering: finite axis values ascending, frames
+        # without the metadata last, original file order as the tie-break.
+        order = np.lexsort(
+            (original_index, order_values, np.isnan(order_values))
+        )
+        original_index = original_index[order]
+        order_values = order_values[order]
     old_to_new = np.full(n_frames, -1, dtype=np.int32)
     old_to_new[original_index] = np.arange(original_index.size, dtype=np.int32)
     return {
@@ -603,8 +616,11 @@ def _read_frames(h5, n_frames: int) -> Dict[str, Any]:
         "original_index": original_index,
         "old_to_new": old_to_new,
         "filename": [names[index] for index in original_index],
-        "pressure": pressure[keep],
+        "pressure": pressure[original_index],
         "excluded_count": int(np.count_nonzero(excluded)),
+        "order_by": axis_key,
+        "order_values": order_values,
+        "order_label": axis_label,
     }
 
 
@@ -1026,6 +1042,8 @@ def _write_h5(
                     "all_peak_policy": "one anchor per retained observation; never collapse by track",
                     "roi_area_method": roi_algorithm,
                     "roi_area_directional": sample_type == "powder",
+                    "order_by": str(frames["order_by"]),
+                    "order_label": str(frames["order_label"]),
                 }
             )
             write_provenance(
@@ -1069,6 +1087,11 @@ def _write_h5(
                 dtype=h5py.string_dtype(encoding="utf-8"),
             )
             _create_dataset(frame_group, "pressure", frames["pressure"])
+            _create_dataset(frame_group, "order_value", frames["order_values"])
+            frame_group["order_value"].attrs["axis"] = str(frames["order_by"])
+            frame_group["order_value"].attrs["label"] = str(
+                frames["order_label"]
+            )
 
             peak_group = h5.create_group("peaks")
             _create_dataset(peak_group, "id", np.arange(peaks.size, dtype=np.int32))
@@ -1179,8 +1202,16 @@ def run_correlations(
     scale_quantile: float = DEFAULT_SCALE_QUANTILE,
     make_plots: bool = True,
     max_anchor_plots: Optional[int] = None,
+    order_by: str = "frame",
 ) -> Dict[str, Any]:
-    """Generate the complete MVP correlation artifact and optional figures."""
+    """Generate the complete MVP correlation artifact and optional figures.
+
+    ``order_by`` orders the retained frames by a /frames metadata axis
+    (``frame`` | ``pressure`` | ``temperature`` | ``time``) before anything
+    downstream sees them, so waterfall rows, window frame axes, and peak
+    ``frame_row`` all follow the physical series. The default keeps the
+    Analysis file order exactly as before.
+    """
 
     import h5py  # type: ignore
 
@@ -1215,8 +1246,8 @@ def run_correlations(
             patterns = patterns[:, ::-1]
         elif np.any(np.diff(radial) <= 0.0):
             raise ValueError("/radial must be strictly monotonic")
-        frames = _read_frames(source_h5, patterns.shape[0])
-        patterns = patterns[frames["keep"]]
+        frames = _read_frames(source_h5, patterns.shape[0], order_by)
+        patterns = patterns[frames["original_index"]]
         lower = float(radial[0]) if radial_min is None else float(radial_min)
         upper = float(radial[-1]) if radial_max is None else float(radial_max)
         if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
@@ -1280,6 +1311,7 @@ def run_correlations(
         "max_anchor_plots": (
             None if max_anchor_plots is None else int(max_anchor_plots)
         ),
+        "order_by": frames["order_by"],
     }
     h5_path = destination / f"correlations_{sample}.h5"
     _write_h5(
@@ -1329,6 +1361,8 @@ def run_correlations(
         "radial_max": float(radial[-1]),
         "n_frames": int(original_positive.shape[0]),
         "n_excluded_frames": int(frames["excluded_count"]),
+        "order_by": frames["order_by"],
+        "order_label": frames["order_label"],
         "n_peaks": int(peaks.size),
         "n_anchors_valid": int(np.count_nonzero(validity["valid"])),
         "n_anchors_edge": int(np.count_nonzero(validity["edge"])),
