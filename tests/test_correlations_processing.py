@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 
 from seriesxrd.correlations.processing import (
+    PeakTable,
+    _roi_profiles,
     compute_window_correlations,
     directional_anchor_iou,
     integrated_iou,
@@ -127,7 +129,7 @@ def test_core_similarity_contracts_include_scalar_location():
         np.r_[np.zeros(10), np.ones(11)],
         x,
     ) == pytest.approx(0.0)
-    assert np.isnan(integrated_iou(np.zeros_like(x), np.zeros_like(x), x))
+    assert integrated_iou(np.zeros_like(x), np.zeros_like(x), x) == 0.0
     scalar = location_similarity(1.0, 1.01, tolerance=0.02)
     assert np.asarray(scalar).shape == ()
     assert float(scalar) == pytest.approx(0.5)
@@ -221,10 +223,66 @@ def test_frozen_powder_directional_absolute_support_contract():
 def test_frozen_single_scalar_minmax_contract_including_both_zero():
     features = np.asarray([0.0, 2.0, 4.0])
     matrix = relative_feature_similarity(features[:, None], features[None, :])
-    assert matrix[0, 0] == 1.0
+    # Two dead ROIs share absence, not similarity: both-zero scores 0, the
+    # same zero-signal convention as the powder directional IoU.
+    assert matrix[0, 0] == 0.0
     assert matrix[0, 1] == 0.0
     assert matrix[1, 2] == pytest.approx(0.5)
-    assert np.allclose(np.diag(matrix), 1.0)
+    assert np.allclose(np.diag(matrix)[1:], 1.0)
+
+
+def test_roi_nan_policy_is_structural():
+    """A masked bin inside a support voids the comparison; outside it doesn't."""
+    radial = np.linspace(0.0, 4.0, 401)
+    flat = np.ones(radial.size)
+
+    poisoned_anchor = flat.copy()
+    poisoned_anchor[200] = np.nan          # radial 2.0, inside (1.0, 3.0)
+    assert np.isnan(directional_anchor_iou(
+        radial, poisoned_anchor, flat,
+        anchor_support=(1.0, 3.0), target_support=(1.0, 3.0),
+    ))
+
+    poisoned_target = flat.copy()
+    poisoned_target[200] = np.nan          # inside the support overlap
+    assert np.isnan(directional_anchor_iou(
+        radial, flat, poisoned_target,
+        anchor_support=(1.0, 3.0), target_support=(1.5, 2.5),
+    ))
+
+    # The same masked bin outside the anchor support and outside the overlap
+    # leaves the score finite.
+    assert directional_anchor_iou(
+        radial, poisoned_anchor, flat,
+        anchor_support=(2.5, 3.5), target_support=(2.5, 3.5),
+    ) == pytest.approx(1.0)
+    assert directional_anchor_iou(
+        radial, flat, poisoned_target,
+        anchor_support=(2.5, 3.5), target_support=(2.5, 3.5),
+    ) == pytest.approx(1.0)
+
+    # _roi_profiles no longer bridges a masked bin: the poisoned samples of
+    # the affected anchor come back NaN instead of interpolated.
+    peaks = PeakTable(
+        source_index=np.asarray([0]),
+        frame_row=np.asarray([0]),
+        original_frame=np.asarray([0]),
+        local_peak=np.asarray([0]),
+        center=np.asarray([2.0]),
+        width=np.asarray([1.0]),
+        half_width=np.asarray([0.75]),
+        area=np.asarray([1.0]),
+        pressure=np.asarray([np.nan]),
+        track=np.asarray([-1]),
+    )
+    coordinate, profiles = _roi_profiles(
+        radial, poisoned_anchor[None, :], peaks
+    )
+    assert np.any(np.isnan(profiles[0]))
+    grid = 2.0 + coordinate * 0.75
+    near_masked = np.abs(grid - 2.0) < 0.02
+    assert np.all(np.isnan(profiles[0][near_masked]))
+    assert np.all(np.isfinite(profiles[0][np.abs(grid - 2.0) > 0.1]))
 
 
 def test_powder_end_to_end_writes_atomic_schema_and_manifest(tmp_path):
@@ -243,8 +301,7 @@ def test_powder_end_to_end_writes_atomic_schema_and_manifest(tmp_path):
     artifact = out / "correlations_powder.h5"
     manifest_path = out / "manifest_powder.json"
     assert artifact.is_file() and manifest_path.is_file()
-    assert not (out / "correlations_powder.h5.tmp").exists()
-    assert not (out / "manifest_powder.json.tmp").exists()
+    assert not list(out.glob("*.tmp*"))
     assert manifest["n_peaks"] == 8
     assert manifest["track_collapsed"] is False
     assert manifest["plots_written"] == 0

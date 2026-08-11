@@ -79,7 +79,7 @@ def test_cli_no_plots_really_writes_and_opens_h5(tmp_path):
         assert h5.attrs["source_resolved"] == "fit:clean"
     manifest = json.loads((out / "manifest_powder.json").read_text())
     assert manifest["plots_written"] == 0
-    assert not any(path.suffix == ".tmp" for path in out.iterdir())
+    assert not any(".tmp" in path.name for path in out.iterdir())
 
 
 def test_cli_missing_input_returns_one(tmp_path):

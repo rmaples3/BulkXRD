@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
@@ -187,7 +188,12 @@ def integrated_iou(
     right: np.ndarray,
     coordinate: Optional[np.ndarray] = None,
 ) -> float:
-    """Continuous min/max IoU for two finite, non-negative profiles."""
+    """Continuous min/max IoU for two finite, non-negative profiles.
+
+    A finite zero denominator (both profiles carry no signal) returns 0.0,
+    matching :func:`directional_anchor_iou`; NaN is reserved for structural
+    invalidity (fewer than two finite samples or a non-finite integral).
+    """
 
     from scipy.integrate import trapezoid
 
@@ -210,8 +216,10 @@ def integrated_iou(
     aa, bb, xx = aa[order], bb[order], xx[order]
     numerator = float(trapezoid(np.minimum(aa, bb), xx))
     denominator = float(trapezoid(np.maximum(aa, bb), xx))
-    if not np.isfinite(denominator) or denominator <= np.finfo(float).eps:
+    if not np.isfinite(denominator):
         return math.nan
+    if denominator <= np.finfo(float).eps:
+        return 0.0
     return float(np.clip(numerator / denominator, 0.0, 1.0))
 
 
@@ -252,6 +260,20 @@ def directional_anchor_iou(
     finite_t = np.isfinite(target)
     if np.count_nonzero(finite_a) < 2 or np.count_nonzero(finite_t) < 2:
         return math.nan
+    # A masked/native NaN bin is structural, not a value this stage may
+    # silently reconstruct (same rule as the window path): inside the anchor
+    # support it voids the anchor, inside the support overlap it voids the
+    # target. The interpolation below then only ever draws boundary values
+    # from bins outside the integration domain, which is legitimate.
+    inside_anchor = (x > a_lo) & (x < a_hi)
+    if np.any(inside_anchor & ~finite_a):
+        return math.nan
+    overlap_lo = max(a_lo, t_lo)
+    overlap_hi = min(a_hi, t_hi)
+    if overlap_lo < overlap_hi:
+        inside_overlap = (x > overlap_lo) & (x < overlap_hi)
+        if np.any(inside_overlap & ~finite_t):
+            return math.nan
 
     knots = [a_lo, a_hi]
     knots.extend(x[(x > a_lo) & (x < a_hi)].tolist())
@@ -307,7 +329,13 @@ def relative_feature_similarity(
     left: np.ndarray | float,
     right: np.ndarray | float,
 ) -> np.ndarray:
-    """Single-crystal scalar ROI similarity ``min/max``; both-zero is one."""
+    """Single-crystal scalar ROI similarity ``min/max``; both-zero is zero.
+
+    Two ROIs that both carry no signal share absence, not similarity -- a
+    masked or empty region must never score as a perfect match. Zero signal
+    in a finite denominator therefore scores 0.0, the same convention as
+    :func:`directional_anchor_iou`; NaN is reserved for non-finite features.
+    """
 
     a, b = np.broadcast_arrays(
         np.asarray(left, dtype=float), np.asarray(right, dtype=float)
@@ -315,7 +343,7 @@ def relative_feature_similarity(
     result = np.full(a.shape, np.nan, dtype=float)
     valid = np.isfinite(a) & np.isfinite(b) & (a >= 0.0) & (b >= 0.0)
     both_zero = valid & (a == 0.0) & (b == 0.0)
-    result[both_zero] = 1.0
+    result[both_zero] = 0.0
     positive = valid & ~both_zero
     maximum = np.maximum(a, b)
     result[positive] = np.minimum(a[positive], b[positive]) / maximum[positive]
@@ -661,14 +689,16 @@ def _roi_profiles(
 ) -> Tuple[np.ndarray, np.ndarray]:
     coordinate = np.linspace(-1.0, 1.0, ROI_PROFILE_POINTS)
     profiles = np.full((peaks.size, coordinate.size), np.nan, dtype=float)
+    if radial.size < 2 or not np.all(np.isfinite(radial)):
+        return coordinate, profiles
     for index in range(peaks.size):
         grid = peaks.center[index] + coordinate * peaks.half_width[index]
         row = transformed[int(peaks.frame_row[index])]
-        finite = np.isfinite(radial) & np.isfinite(row)
-        if np.count_nonzero(finite) >= 2:
-            profiles[index] = np.interp(
-                grid, radial[finite], row[finite], left=np.nan, right=np.nan
-            )
+        # Interpolate the full row: a masked/native NaN bin is structural and
+        # poisons the samples adjacent to it instead of being bridged.
+        profiles[index] = np.interp(
+            grid, radial, row, left=np.nan, right=np.nan
+        )
     return coordinate, profiles
 
 
@@ -772,9 +802,10 @@ def _write_h5(
 ) -> None:
     import h5py  # type: ignore
 
-    tmp = path.with_name(path.name + ".tmp")
-    if tmp.exists():
-        tmp.unlink()
+    # Unique per run so two concurrent same-sample runs into one directory
+    # cannot clobber each other's staging file. (core.config.write_json still
+    # uses a fixed .json.tmp -- same latent race, tracked separately.)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
     try:
         with h5py.File(str(tmp), "w") as h5:
             h5.attrs.update(
@@ -874,9 +905,7 @@ def _write_h5(
                 "[0,1], NaN=same-frame comparison or structurally unavailable "
                 "observation/support"
             )
-            anchors["roi_area"].attrs["zero_denominator"] = (
-                "0" if sample_type == "powder" else "both-zero features compare as 1"
-            )
+            anchors["roi_area"].attrs["zero_denominator"] = "0"
             anchors["roi_area"].attrs["algorithm"] = roi_algorithm
             anchors["roi_area"].attrs["directional"] = sample_type == "powder"
             anchors["roi_area"].attrs["same_frame_policy"] = "NaN"
@@ -1014,7 +1043,7 @@ def run_correlations(
         roi_feature = _single_roi_features(roi_profiles)
         roi_area = _single_roi_matrix(roi_feature)
         roi_algorithm = (
-            "min(feature_i,feature_j)/max(feature_i,feature_j);both_zero=1;"
+            "min(feature_i,feature_j)/max(feature_i,feature_j);both_zero=0;"
             "feature=one_dimensional_radial_mean_approximation_of_raw_pixel_"
             "positive_log_squared_roi_mean"
         )

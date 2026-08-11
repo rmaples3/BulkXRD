@@ -237,7 +237,8 @@ is a directional integrated IoU on the anchor's absolute native-radial
 support. The target is zero outside its own support; profiles are not
 recentered or width-normalized, so the matrix need not be symmetric. For
 single crystal, every `/spots/obs` row remains independent and the score is
-`min(feature_i, feature_j) / max(feature_i, feature_j)` (`both zero = 1`).
+`min(feature_i, feature_j) / max(feature_i, feature_j)` (`both zero = 0`:
+two ROIs that both carry no signal share absence, not similarity).
 The feature is a one-dimensional positive-Log² radial ROI approximation; it
 is not a raw-detector-pixel measurement. The track column is never used to
 group, filter, or score observations. In both sample modes, target peaks from

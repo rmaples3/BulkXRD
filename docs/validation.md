@@ -152,6 +152,13 @@ These outputs are for guidance and screening, not for quantitative claims:
 - **Structural peak cells stay missing.** ROI/location comparisons against
   peaks in the anchor's own frame are stored as `NaN` and plotted blank; they
   are not computed zeros.
+- **Masked bins are structural in both ROI and window paths.** A non-finite
+  native bin inside an anchor's support (or inside the support overlap, for
+  the target) voids that ROI comparison as `NaN` rather than being bridged
+  by interpolation, matching the window rule. Zero *signal* is different
+  from missing data: a finite zero denominator scores `0`, including the
+  single-crystal both-zero case (two dead ROIs share absence, not
+  similarity).
 - **Pearson windows can be undefined.** A constant or structurally invalid
   window has no variance and is stored as `NaN`, not forced to zero. FFT-ACF
   fingerprints are standardized, use positive lags only, and exclude lag
