@@ -13,7 +13,11 @@ from ..core.config import (
     now_iso, now_timestamp, output_base,
 )
 from ..core.naming import next_available_path
-from ..core.processes import terminate_process_tree, worker_popen
+from ..core.processes import (
+    open_in_file_manager,
+    terminate_process_tree,
+    worker_popen,
+)
 from ..guikit import theme
 from ..guikit.tkstyle import apply_theme
 from ..guikit.tooltip import ToolTip as _ToolTip
@@ -1252,13 +1256,7 @@ class AnalysisApp:
             self.log("No output folder to open yet.", "WARN")
             return
         try:
-            if sys.platform.startswith("win"):
-                import os as _os
-                _os.startfile(str(folder))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(folder)])
-            else:
-                subprocess.Popen(["xdg-open", str(folder)])
+            open_in_file_manager(folder)
         except Exception as exc:
             self.log(f"Could not open {folder}: {exc!r}", "WARN")
 

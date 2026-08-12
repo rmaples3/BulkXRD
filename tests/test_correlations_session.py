@@ -135,15 +135,56 @@ def test_headless_gui_command_matches_supported_batch_contract(tmp_path):
         "location_tolerance": "0.06",
     }
 
-    command, result_root = controller._build_batch_command()
+    command, result_root, run_dir, sample_type = (
+        controller._build_batch_command()
+    )
     parsed = build_parser().parse_args(command[3:])
 
     assert result_root == (tmp_path / "results")
+    assert sample_type == "single_crystal"
+    # The -m launch resolves the package because run_dir holds the checkout.
+    assert (run_dir / "seriesxrd" / "correlations" / "batch.py").is_file()
     assert parsed.analysis == str(analysis_h5.resolve())
     assert parsed.out == str(result_root)
     assert parsed.sample_type == "single_crystal"
     assert parsed.source == "spots"
     assert parsed.location_tol == 0.06
+    # New knobs ride along with their defaults.
+    assert parsed.order_by == "frame"
+    assert parsed.scale_quantile == 0.995
+    assert parsed.max_anchor_plots is None
+    assert not parsed.no_plots
+    assert not parsed.no_tracks
+    assert parsed.track_min_similarity == 0.2
+    assert parsed.track_group_by == "none"
+
+
+def test_headless_gui_command_honors_configured_interpreter(tmp_path):
+    analysis_h5 = tmp_path / "analysis.h5"
+    analysis_h5.touch()
+    controller = CorrelationApp.__new__(CorrelationApp)
+    controller.vars = {}
+    controller.config = {
+        "analysis_h5_file": str(analysis_h5),
+        "result_root": str(tmp_path / "results"),
+        "sample_type": "powder",
+        "source": "fit",
+        "window_width": "5.0",
+        "window_step": "1.0",
+        "location_tolerance": "0.02",
+        "python_exe": "/opt/custom/python3",
+        "skip_plots": True,
+        "max_anchor_plots": "12",
+        "order_by": "pressure",
+        "make_tracks": False,
+    }
+
+    command, _root, _run_dir, _sample = controller._build_batch_command()
+    assert command[0] == "/opt/custom/python3"
+    parsed = build_parser().parse_args(command[3:])
+    assert parsed.no_plots and parsed.no_tracks
+    assert parsed.max_anchor_plots == 12
+    assert parsed.order_by == "pressure"
 
 
 def test_gui_sample_switch_applies_safe_profile_source_default():
@@ -196,6 +237,126 @@ def test_successful_worker_reviews_the_result_root_snapshotted_at_launch(tmp_pat
     assert controller._active_result_root is None
     assert controller._run_proc is None
     assert reviewed == [{"show_errors": False, "result_root": launched_root}]
+
+
+def test_successful_worker_reads_manifest_and_records_artifact(tmp_path):
+    class _Widget:
+        def __init__(self):
+            self.options = {}
+
+        def configure(self, **kwargs):
+            self.options.update(kwargs)
+
+    launched_root = tmp_path / "results"
+    launched_root.mkdir()
+    manifest = {
+        "correlations_h5": str(launched_root / "correlations_powder.h5"),
+        "n_frames": 4,
+        "n_peaks": 8,
+        "n_anchors_valid": 7,
+        "n_windows": 6,
+        "plots_written": 30,
+        "tracks": {"n_tracks": 2, "n_transition_candidates": 1},
+    }
+    _write_json(launched_root / "manifest_powder.json", manifest)
+
+    controller = CorrelationApp.__new__(CorrelationApp)
+    controller._active_result_root = launched_root
+    controller._active_sample_type = "powder"
+    controller._run_started = 0.0
+    controller._run_proc = object()
+    controller._cancel_requested = False
+    controller._setting_widgets = []
+    controller.config = {}
+    controller.save_config = lambda silent=False: None
+    controller.run_button = _Widget()
+    controller.cancel_button = _Widget()
+    controller.run_status = _Widget()
+    controller._status_bar = _Widget()
+    logged = []
+    controller.log = lambda message, level="INFO": logged.append(message)
+    controller.review_results = lambda **kwargs: None
+
+    controller._handle_worker_event(("done", 0))
+
+    assert controller.config["correlations_h5"] == manifest["correlations_h5"]
+    summary = controller.run_status.options["text"]
+    assert "4 frames" in summary
+    assert "7/8 anchors" in summary
+    assert "2 tracks" in summary
+    assert "30 PNGs" in summary
+
+
+def test_drain_queues_survives_a_failing_handler():
+    """One raising event handler must not kill the poll loop."""
+    import queue as queue_module
+
+    controller = CorrelationApp.__new__(CorrelationApp)
+    controller._closing = False
+    controller._poll_after_id = None
+    controller._log_queue = queue_module.Queue()
+    controller._event_queue = queue_module.Queue()
+    handled = []
+    rearmed = []
+    controller._schedule_queue_poll = lambda: rearmed.append(True)
+    controller._insert_log_line = lambda line: handled.append(line)
+
+    def _boom(event):
+        if event[1] == "explode":
+            raise RuntimeError("widget destroyed")
+        handled.append(event)
+
+    controller._handle_worker_event = _boom
+    controller.log = lambda message, level="INFO": None
+    controller._event_queue.put(("done", "explode"))
+    controller._event_queue.put(("done", 0))
+    controller._log_queue.put("a line")
+
+    controller._drain_queues()
+
+    assert ("done", 0) in handled       # the later event still processed
+    assert "a line" in handled
+    assert rearmed == [True]            # the poll loop re-armed exactly once
+
+
+def test_set_run_ui_state_locks_and_restores_settings():
+    class _Widget:
+        def __init__(self):
+            self.state = None
+
+        def configure(self, state=None, **_kwargs):
+            self.state = state
+
+    controller = CorrelationApp.__new__(CorrelationApp)
+    controller.run_button = _Widget()
+    controller.cancel_button = _Widget()
+    entry, combo = _Widget(), _Widget()
+    controller._setting_widgets = [(entry, "normal"), (combo, "readonly")]
+
+    controller._set_run_ui_state(True)
+    assert controller.run_button.state == "disabled"
+    assert controller.cancel_button.state == "normal"
+    assert entry.state == "disabled" and combo.state == "disabled"
+
+    controller._set_run_ui_state(False)
+    assert controller.run_button.state == "normal"
+    assert controller.cancel_button.state == "disabled"
+    assert entry.state == "normal" and combo.state == "readonly"
+
+
+def test_write_failure_log_persists_recent_lines(tmp_path):
+    controller = CorrelationApp.__new__(CorrelationApp)
+    controller.config = {"logs_root": str(tmp_path / "logs")}
+    controller._log_history = [f"line {index}" for index in range(600)]
+
+    target = controller._write_failure_log()
+    assert target is not None and target.is_file()
+    text = target.read_text(encoding="utf-8")
+    assert "line 599" in text
+    assert "line 99" not in text        # only the recent tail is kept
+
+    controller.config = {}
+    assert controller._write_failure_log() is None
 
 
 def test_missing_selected_png_clears_the_previous_preview(tmp_path):

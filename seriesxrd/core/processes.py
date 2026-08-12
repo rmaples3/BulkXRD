@@ -19,6 +19,23 @@ def worker_popen(args: Sequence[str], **kwargs: Any) -> subprocess.Popen:
     return subprocess.Popen(args, **kwargs)
 
 
+def open_in_file_manager(path: Any) -> None:
+    """Open a folder (or file) in the platform's file manager.
+
+    Best effort: raises when the platform launcher itself cannot be started,
+    so callers surface the failure in their own UI/log.
+    """
+    import sys
+
+    target = str(path)
+    if sys.platform.startswith("win"):
+        os.startfile(target)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", target])
+    else:
+        subprocess.Popen(["xdg-open", target])
+
+
 def terminate_process_tree(proc: "subprocess.Popen | None", *,
                            timeout: float = 1.5) -> None:
     """Terminate ``proc`` and any children it spawned, returning quickly."""

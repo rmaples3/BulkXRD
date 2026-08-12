@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ..core.config import (
     default_python_exe,
+    default_workspace_paths,
     now_iso,
     read_json,
     write_json,
@@ -30,6 +31,16 @@ _DEFAULTS = {
     "window_width": "5.0",
     "window_step": "1.0",
     "location_tolerance": "0.02",
+    "scale_quantile": "0.995",
+    "order_by": "frame",
+    "skip_plots": False,
+    "max_anchor_plots": "",
+    "make_tracks": True,
+    "track_min_similarity": "0.2",
+    "track_min_frames": "3",
+    "track_link_tol_fwhm": "1.5",
+    "track_max_gap": "2",
+    "track_group_by": "none",
 }
 
 
@@ -54,7 +65,9 @@ def seed_correlation_config(workspace_dir: "str | Path") -> Path:
     defaults.update({
         "created_at": now_iso(),
         "workspace_root": str(workspace),
+        "backend_dir": str(Path(__file__).resolve().parents[1]),
         "python_exe": default_python_exe(),
+        "logs_root": default_workspace_paths(workspace)["logs_root"],
         "result_root": str(workspace / "correlations"),
     })
     for key, value in defaults.items():

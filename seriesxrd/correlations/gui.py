@@ -14,10 +14,22 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Dict, Mapping
 
-from ..core.config import TOOL_NAME, ensure_dir, now_iso, read_json, write_json
-from ..core.processes import terminate_process_tree, worker_popen
+from ..core.config import (
+    TOOL_NAME,
+    ensure_dir,
+    now_iso,
+    now_timestamp,
+    read_json,
+    write_json,
+)
+from ..core.processes import (
+    open_in_file_manager,
+    terminate_process_tree,
+    worker_popen,
+)
 from ..guikit import theme
 from ..guikit.tkstyle import apply_theme
 from ..guikit.tooltip import ToolTip as _ToolTip
@@ -33,9 +45,15 @@ RESULT_CATEGORY_LABELS = {
     "roi_area": "ROI area",
     "location": "Peak location",
     "waterfall": "Waterfall",
+    "tracks": "Peak tracks",
     "window_across": "Window across frames",
     "window_within": "Window within frame",
 }
+ORDER_AXES = ("frame", "pressure", "temperature", "time")
+TRACK_GROUPS = ("none", "scan", "folder")
+# The Results tree renders at most this many leaves per filter pass; beyond
+# it the browser stays responsive and asks the user to narrow the search.
+MAX_RESULT_LEAVES = 2000
 RESULT_CATEGORY_ORDER = {
     key: index for index, key in enumerate(RESULT_CATEGORY_LABELS)
 }
@@ -126,6 +144,9 @@ def _classify_result_path(
             pressure_label, pressure_value = _pressure_label(parts[heatmap_index + 3])
         except IndexError:
             pass
+    elif category == "tracks":
+        pressure_label = "All pressures"
+        pressure_value = float("-inf")
     elif category == "window_across":
         pressure_label = "All pressures"
         pressure_value = float("-inf")
@@ -229,6 +250,18 @@ def _find_result_paths(result_root: Path) -> "list[Path]":
     )
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Robust truthiness for config values that may be bool or text."""
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 def _tk_imports():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -257,6 +290,16 @@ class CorrelationApp:
         self.config.setdefault("window_width", "5.0")
         self.config.setdefault("window_step", "1.0")
         self.config.setdefault("location_tolerance", "0.02")
+        self.config.setdefault("scale_quantile", "0.995")
+        self.config.setdefault("order_by", "frame")
+        self.config.setdefault("skip_plots", False)
+        self.config.setdefault("max_anchor_plots", "")
+        self.config.setdefault("make_tracks", True)
+        self.config.setdefault("track_min_similarity", "0.2")
+        self.config.setdefault("track_min_frames", "3")
+        self.config.setdefault("track_link_tol_fwhm", "1.5")
+        self.config.setdefault("track_max_gap", "2")
+        self.config.setdefault("track_group_by", "none")
         self.config["transform"] = "log_squared"
 
         if parent is None:
@@ -274,6 +317,8 @@ class CorrelationApp:
         self.vars: Dict[str, Any] = {}
         self._run_proc: "subprocess.Popen | None" = None
         self._active_result_root: "Path | None" = None
+        self._active_sample_type = ""
+        self._run_started = 0.0
         self._review_result_root: "Path | None" = None
         self._cancel_requested = False
         self._closing = False
@@ -287,6 +332,13 @@ class CorrelationApp:
         self._result_paths: "dict[str, Path]" = {}
         self._result_entries: "list[Dict[str, Any]]" = []
         self._preview_photo = None
+        # (key, PIL.Image) of the last decoded PNG and (key, w, h) of the
+        # last rendered thumbnail: a <Configure> storm re-reads nothing.
+        self._preview_cache = None
+        self._preview_last = None
+        self._last_filter_signature = None
+        # (widget, idle state) pairs locked while a run is live.
+        self._setting_widgets: "list[tuple[Any, str]]" = []
 
         self._build_gui()
         theme.register_widget_tree(self._embed_parent or self.root)
@@ -410,6 +462,11 @@ class CorrelationApp:
         self._nav_rail.see(item)
         self.pages[key].tkraise()
 
+    def _register_setting(self, widget, idle_state: str = "normal"):
+        """Lock this widget while a run is live; restore to ``idle_state``."""
+        self._setting_widgets.append((widget, idle_state))
+        return widget
+
     def _field(self, parent, key: str, label: str, *, row: int, browse=None):
         ttk, tk = self.ttk, self.tk
         variable = tk.StringVar(value=str(self.config.get(key, "") or ""))
@@ -419,6 +476,7 @@ class CorrelationApp:
         )
         entry = ttk.Entry(parent, textvariable=variable)
         entry.grid(row=row, column=1, sticky="ew", padx=4, pady=4)
+        self._register_setting(entry)
         if browse:
             ttk.Button(
                 parent, text="Browse…",
@@ -426,6 +484,35 @@ class CorrelationApp:
             ).grid(row=row, column=2, sticky="w", padx=4, pady=4)
         parent.columnconfigure(1, weight=1)
         return entry
+
+    def _combo(self, parent, key: str, label: str, values, *, row: int,
+               width: int = 22, command=None):
+        ttk, tk = self.ttk, self.tk
+        variable = tk.StringVar(value=str(self.config.get(key, values[0])))
+        self.vars[key] = variable
+        ttk.Label(parent, text=label).grid(
+            row=row, column=0, sticky="w", padx=4, pady=4,
+        )
+        box = ttk.Combobox(
+            parent, textvariable=variable, values=tuple(values),
+            state="readonly", width=width,
+        )
+        box.grid(row=row, column=1, sticky="w", padx=4, pady=4)
+        if command is not None:
+            box.bind("<<ComboboxSelected>>", command)
+        self._register_setting(box, idle_state="readonly")
+        return box
+
+    def _check(self, parent, key: str, label: str, *, row: int, default=False):
+        ttk, tk = self.ttk, self.tk
+        variable = tk.BooleanVar(
+            value=_as_bool(self.config.get(key, default), default)
+        )
+        self.vars[key] = variable
+        box = ttk.Checkbutton(parent, text=label, variable=variable)
+        box.grid(row=row, column=1, sticky="w", padx=4, pady=4)
+        self._register_setting(box)
+        return box
 
     def _page_input(self, frame):
         ttk = self.ttk
@@ -458,28 +545,12 @@ class CorrelationApp:
         )
 
     def _page_settings(self, frame):
-        ttk, tk = self.ttk, self.tk
-        ttk.Label(frame, text="Sample type").grid(
-            row=0, column=0, sticky="w", padx=4, pady=4,
+        ttk = self.ttk
+        self._combo(
+            frame, "sample_type", "Sample type", SAMPLE_TYPES,
+            row=0, command=self._sample_type_changed,
         )
-        sample_var = tk.StringVar(value=str(self.config.get("sample_type", "powder")))
-        self.vars["sample_type"] = sample_var
-        sample_box = ttk.Combobox(
-            frame, textvariable=sample_var, values=SAMPLE_TYPES,
-            state="readonly", width=22,
-        )
-        sample_box.grid(row=0, column=1, sticky="w", padx=4, pady=4)
-        sample_box.bind("<<ComboboxSelected>>", self._sample_type_changed)
-
-        ttk.Label(frame, text="Profile source").grid(
-            row=1, column=0, sticky="w", padx=4, pady=4,
-        )
-        source_var = tk.StringVar(value=str(self.config.get("source", "fit")))
-        self.vars["source"] = source_var
-        ttk.Combobox(
-            frame, textvariable=source_var, values=SOURCES,
-            state="readonly", width=22,
-        ).grid(row=1, column=1, sticky="w", padx=4, pady=4)
+        self._combo(frame, "source", "Profile source", SOURCES, row=1)
 
         ttk.Label(frame, text="Intensity transform").grid(
             row=2, column=0, sticky="w", padx=4, pady=4,
@@ -493,17 +564,71 @@ class CorrelationApp:
             "The correlation pipeline uses fixed bounded Log² preprocessing.",
         )
 
-        self._field(frame, "radial_min", "Radial minimum (optional)", row=3)
-        self._field(frame, "radial_max", "Radial maximum (optional)", row=4)
+        order_box = self._combo(
+            frame, "order_by", "Order frames by", ORDER_AXES, row=3,
+        )
+        _ToolTip(
+            order_box,
+            "Orders the series by /frames metadata before correlating; "
+            "waterfall rows, window frame axes, and peak tracks follow it. "
+            "'frame' keeps the Analysis file order.",
+        )
+        self._field(frame, "radial_min", "Radial minimum (optional)", row=4)
+        self._field(frame, "radial_max", "Radial maximum (optional)", row=5)
         self._field(
-            frame, "window_width", "Window width (native radial unit)", row=5,
+            frame, "window_width", "Window width (native radial unit)", row=6,
         )
         self._field(
-            frame, "window_step", "Window step (native radial unit)", row=6,
+            frame, "window_step", "Window step (native radial unit)", row=7,
         )
         self._field(
-            frame, "location_tolerance", "Peak-location tolerance", row=7,
+            frame, "location_tolerance", "Peak-location tolerance", row=8,
         )
+        quantile_entry = self._field(
+            frame, "scale_quantile", "Pooled-scale quantile", row=9,
+        )
+        _ToolTip(
+            quantile_entry,
+            "Quantile of the pooled positive intensities that fixes the one "
+            "Log² scale shared by every frame (default 0.995).",
+        )
+        self._check(frame, "skip_plots", "Skip PNG rendering (HDF5 only)",
+                    row=10)
+        cap_entry = self._field(
+            frame, "max_anchor_plots", "Per-anchor plot cap (optional)",
+            row=11,
+        )
+        _ToolTip(
+            cap_entry,
+            "Render per-anchor PNGs for at most this many valid anchors; "
+            "every matrix stays complete in the HDF5. Blank = no cap.",
+        )
+
+        ttk.Label(
+            frame, text="Peak tracks (exploratory)", style="Accent.TLabel",
+        ).grid(row=12, column=0, sticky="w", padx=4, pady=(12, 2))
+        self._check(
+            frame, "make_tracks",
+            "Link peaks into ROI-gated tracks + transition screening",
+            row=13, default=True,
+        )
+        self._field(
+            frame, "track_min_similarity",
+            "Track ROI-similarity gate (0 disables)", row=14,
+        )
+        self._field(
+            frame, "track_min_frames", "Track minimum frames", row=15,
+        )
+        self._field(
+            frame, "track_link_tol_fwhm", "Track position gate (× width)",
+            row=16,
+        )
+        self._field(frame, "track_max_gap", "Track frame-gap tolerance",
+                    row=17)
+        self._combo(
+            frame, "track_group_by", "Track grouping", TRACK_GROUPS, row=18,
+        )
+
         note = ttk.Label(
             frame,
             text=(
@@ -516,7 +641,7 @@ class CorrelationApp:
             ),
             style="Muted.TLabel", justify="left", wraplength=760,
         )
-        note.grid(row=8, column=0, columnspan=3, sticky="w", padx=4, pady=(12, 4))
+        note.grid(row=19, column=0, columnspan=3, sticky="w", padx=4, pady=(12, 4))
         frame.columnconfigure(1, weight=1)
 
     def _page_run(self, frame):
@@ -541,6 +666,14 @@ class CorrelationApp:
             buttons, text="Cancel", command=self._cancel_run, state="disabled",
         )
         self.cancel_button.pack(side="left", padx=4)
+        self.progress = ttk.Progressbar(
+            frame, mode="determinate", maximum=100, value=0, length=440,
+        )
+        self.progress.pack(anchor="w", padx=4, pady=(12, 2))
+        self.progress_label = ttk.Label(
+            frame, text="", style="Muted.TLabel",
+        )
+        self.progress_label.pack(anchor="w", padx=4)
         self.run_status = ttk.Label(
             frame, text="Ready.", style="Muted.TLabel", justify="left",
             wraplength=760,
@@ -553,6 +686,9 @@ class CorrelationApp:
         toolbar.pack(fill="x", pady=(0, 6))
         ttk.Button(
             toolbar, text="Refresh heatmaps", command=self.review_results,
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            toolbar, text="Open folder", command=self._open_results_folder,
         ).pack(side="left", padx=2)
         self.results_status = ttk.Label(
             toolbar, text="No results loaded.", style="Muted.TLabel",
@@ -734,7 +870,36 @@ class CorrelationApp:
             raise ValueError(f"{label} must be greater than zero.")
         return number
 
-    def _build_batch_command(self) -> "tuple[list[str], Path]":
+    @staticmethod
+    def _optional_int(value: Any, label: str, *, minimum: int = 1) -> "int | None":
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            number = int(text)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a whole number or blank.") from exc
+        if number < minimum:
+            raise ValueError(f"{label} must be at least {minimum}.")
+        return number
+
+    @staticmethod
+    def _required_int(value: Any, label: str, *, minimum: int = 0) -> int:
+        try:
+            number = int(str(value or "").strip())
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a whole number.") from exc
+        if number < minimum:
+            raise ValueError(f"{label} must be at least {minimum}.")
+        return number
+
+    def _config_text(self, key: str, default: str) -> str:
+        """Config value as text, with blank/missing falling back to default."""
+        value = self.config.get(key)
+        text = str(value).strip() if value is not None else ""
+        return text if text else default
+
+    def _build_batch_command(self) -> "tuple[list[str], Path, Path, str]":
         self.pull_vars()
         analysis = Path(
             str(self.config.get("analysis_h5_file", "") or "").strip()
@@ -746,12 +911,34 @@ class CorrelationApp:
             raise ValueError("Select a result folder before running.")
         result_root = ensure_dir(result_text)
 
+        # Honor the configured interpreter/backend like the other stages; the
+        # -m launch then resolves the package from the backend checkout for
+        # ANY interpreter because run_dir sits on sys.path.
+        python_exe = (
+            str(self.config.get("python_exe", "") or "").strip()
+            or sys.executable
+        )
+        backend_dir = Path(
+            str(self.config.get("backend_dir", "") or "").strip()
+            or Path(__file__).resolve().parents[1]
+        )
+        batch_script = backend_dir / "correlations" / "batch.py"
+        if not batch_script.is_file():
+            raise ValueError(
+                "Correlation batch module not found:\n"
+                f"{batch_script}\n\nCheck 'backend_dir' in the session config."
+            )
+        run_dir = backend_dir.parent
+
         sample_type = str(self.config.get("sample_type", "powder") or "powder")
         source = str(self.config.get("source", "fit") or "fit")
         if sample_type not in SAMPLE_TYPES:
             raise ValueError(f"Unknown sample type: {sample_type}")
         if source not in SOURCES:
             raise ValueError(f"Unknown profile source: {source}")
+        order_by = str(self.config.get("order_by", "frame") or "frame")
+        if order_by not in ORDER_AXES:
+            raise ValueError(f"Unknown frame ordering: {order_by}")
         radial_min = self._optional_float(self.config.get("radial_min"), "Radial minimum")
         radial_max = self._optional_float(self.config.get("radial_max"), "Radial maximum")
         if radial_min is not None and radial_max is not None and radial_min >= radial_max:
@@ -761,9 +948,18 @@ class CorrelationApp:
         location_tolerance = self._positive_float(
             self.config.get("location_tolerance"), "Peak-location tolerance",
         )
+        scale_quantile = self._positive_float(
+            self._config_text("scale_quantile", "0.995"),
+            "Pooled-scale quantile",
+        )
+        if scale_quantile > 1.0:
+            raise ValueError("Pooled-scale quantile must be at most 1.")
+        max_anchor_plots = self._optional_int(
+            self.config.get("max_anchor_plots"), "Per-anchor plot cap",
+        )
 
         command = [
-            sys.executable,
+            python_exe,
             "-m",
             "seriesxrd.correlations.batch",
             str(analysis.resolve()),
@@ -773,18 +969,63 @@ class CorrelationApp:
             sample_type,
             "--source",
             source,
+            "--order-by",
+            order_by,
             "--window-width",
             str(window_width),
             "--window-step",
             str(window_step),
             "--location-tolerance",
             str(location_tolerance),
+            "--scale-quantile",
+            str(scale_quantile),
         ]
         if radial_min is not None:
             command.extend(("--radial-min", str(radial_min)))
         if radial_max is not None:
             command.extend(("--radial-max", str(radial_max)))
-        return command, result_root
+        if _as_bool(self.config.get("skip_plots"), False):
+            command.append("--no-plots")
+        if max_anchor_plots is not None:
+            command.extend(("--max-anchor-plots", str(max_anchor_plots)))
+        if not _as_bool(self.config.get("make_tracks", True), True):
+            command.append("--no-tracks")
+        else:
+            gate = self._positive_float(
+                self._config_text("track_link_tol_fwhm", "1.5"),
+                "Track position gate",
+            )
+            try:
+                similarity = float(
+                    self._config_text("track_min_similarity", "0.2")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "Track ROI-similarity gate must be a number."
+                ) from exc
+            if not similarity >= 0.0:
+                raise ValueError("Track ROI-similarity gate must be >= 0.")
+            min_frames = self._required_int(
+                self._config_text("track_min_frames", "3"),
+                "Track minimum frames", minimum=1,
+            )
+            max_gap = self._required_int(
+                self._config_text("track_max_gap", "2"),
+                "Track frame-gap tolerance", minimum=0,
+            )
+            group_by = self._config_text("track_group_by", "none")
+            if group_by not in TRACK_GROUPS:
+                raise ValueError(f"Unknown track grouping: {group_by}")
+            command.extend(
+                (
+                    "--track-min-similarity", str(similarity),
+                    "--track-min-frames", str(min_frames),
+                    "--track-link-tol-fwhm", str(gate),
+                    "--track-max-gap", str(max_gap),
+                    "--track-group-by", group_by,
+                )
+            )
+        return command, result_root, run_dir, sample_type
 
     def run_clicked(self):
         if self._run_proc is not None and self._run_proc.poll() is None:
@@ -793,7 +1034,9 @@ class CorrelationApp:
             )
             return
         try:
-            command, result_root = self._build_batch_command()
+            command, result_root, run_dir, sample_type = (
+                self._build_batch_command()
+            )
             self.save_config(silent=True)
         except (OSError, ValueError) as exc:
             self.messagebox.showerror("Cannot run correlations", str(exc))
@@ -804,6 +1047,7 @@ class CorrelationApp:
         try:
             process = worker_popen(
                 command,
+                cwd=str(run_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -817,8 +1061,11 @@ class CorrelationApp:
         self._run_proc = process
         self._cancel_requested = False
         self._active_result_root = result_root
-        self.run_button.configure(state="disabled")
-        self.cancel_button.configure(state="normal")
+        self._active_sample_type = sample_type
+        self._run_started = time.monotonic()
+        self._set_run_ui_state(True)
+        self.progress.configure(maximum=100, value=0)
+        self.progress_label.configure(text="Starting worker …")
         self.run_status.configure(
             text="Running Log² correlations…", style="Accent.TLabel",
         )
@@ -828,11 +1075,33 @@ class CorrelationApp:
             target=self._read_worker, args=(process,), daemon=True,
         ).start()
 
+        # Watchdog: close stdout once the process exits so the reader loop
+        # cannot hang on a pipe some child still holds open.
+        def _watch(target=process):
+            target.wait()
+            try:
+                if target.stdout is not None:
+                    target.stdout.close()
+            except Exception:
+                pass
+
+        threading.Thread(target=_watch, daemon=True).start()
+
     def _read_worker(self, process: subprocess.Popen):
         try:
             if process.stdout is not None:
                 for raw_line in process.stdout:
-                    self._log_queue.put(raw_line.rstrip())
+                    line = raw_line.rstrip()
+                    parts = line.split()
+                    if len(parts) == 3 and parts[0] == "[CORRELATIONS]":
+                        try:
+                            done, total = int(parts[1]), int(parts[2])
+                        except ValueError:
+                            pass
+                        else:
+                            self._event_queue.put(("progress", done, total))
+                            continue
+                    self._log_queue.put(line)
             returncode = int(process.wait())
             self._event_queue.put(("done", returncode))
         except Exception as exc:
@@ -844,32 +1113,107 @@ class CorrelationApp:
         self._poll_after_id = self.root.after(100, self._drain_queues)
 
     def _drain_queues(self):
+        # A single failing handler (for example a TclError from a widget torn
+        # down mid-run) must never kill this poll loop: the finally re-arm is
+        # what keeps the GUI able to learn that the run finished.
         self._poll_after_id = None
-        while True:
+        try:
+            while True:
+                try:
+                    line = self._log_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._insert_log_line(line)
+                except Exception:
+                    pass
+            while True:
+                try:
+                    event = self._event_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if event[0] == "progress":
+                        self._update_progress(int(event[1]), int(event[2]))
+                    else:
+                        self._handle_worker_event(event)
+                except Exception as exc:
+                    try:
+                        self.log(f"Worker event failed: {exc!r}", "WARN")
+                    except Exception:
+                        pass
+        finally:
+            self._schedule_queue_poll()
+
+    def _update_progress(self, done: int, total: int):
+        maximum = max(int(total), 1)
+        self.progress.configure(maximum=maximum, value=min(done, maximum))
+        self.progress_label.configure(text=f"{done} / {total}")
+
+    def _set_run_ui_state(self, running: bool):
+        self.run_button.configure(state="disabled" if running else "normal")
+        self.cancel_button.configure(state="normal" if running else "disabled")
+        for widget, idle_state in getattr(self, "_setting_widgets", []):
             try:
-                line = self._log_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._insert_log_line(line)
-        while True:
-            try:
-                event = self._event_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_worker_event(event)
-        self._schedule_queue_poll()
+                widget.configure(state="disabled" if running else idle_state)
+            except Exception:
+                pass
+
+    def _write_failure_log(self) -> "Path | None":
+        """Persist the recent log tail so a failed run leaves evidence."""
+        logs_root = str(self.config.get("logs_root", "") or "").strip()
+        if not logs_root:
+            return None
+        try:
+            folder = ensure_dir(logs_root)
+            target = Path(folder) / f"correlations_{now_timestamp()}.log"
+            target.write_text(
+                "\n".join(self._log_history[-500:]) + "\n", encoding="utf-8",
+            )
+            return target
+        except OSError:
+            return None
+
+    def _completion_summary(self, manifest: Mapping[str, Any]) -> str:
+        elapsed = time.monotonic() - float(self._run_started or 0.0)
+        pieces = [f"{manifest.get('n_frames', '?')} frames"]
+        valid = manifest.get("n_anchors_valid")
+        total = manifest.get("n_peaks")
+        if valid is not None and total is not None:
+            pieces.append(f"{valid}/{total} anchors")
+        elif total is not None:
+            pieces.append(f"{total} anchors")
+        if manifest.get("n_windows") is not None:
+            pieces.append(f"{manifest['n_windows']} windows")
+        track_info = manifest.get("tracks")
+        if isinstance(track_info, Mapping):
+            pieces.append(
+                f"{track_info.get('n_tracks', 0)} tracks "
+                f"({track_info.get('n_transition_candidates', 0)} candidate "
+                "intervals)"
+            )
+        pieces.append(f"{manifest.get('plots_written', 0)} PNGs")
+        if 0.0 < elapsed < 86400.0:
+            pieces.append(f"{elapsed:.0f}s")
+        return "Correlation run complete: " + ", ".join(
+            str(piece) for piece in pieces
+        )
 
     def _handle_worker_event(self, event: tuple):
         kind = event[0]
         active_result_root = self._active_result_root
+        sample_type = getattr(self, "_active_sample_type", "") or "powder"
         self._active_result_root = None
         self._run_proc = None
-        self.run_button.configure(state="normal")
-        self.cancel_button.configure(state="disabled")
+        self._set_run_ui_state(False)
         if kind == "error":
             self.run_status.configure(text="Worker error.", style="Warn.TLabel")
             self._status_bar.configure(text="correlation worker: failed")
-            self.messagebox.showerror("Correlation worker error", str(event[1]))
+            log_path = self._write_failure_log()
+            suffix = f"\n\nLog saved to:\n{log_path}" if log_path else ""
+            self.messagebox.showerror(
+                "Correlation worker error", str(event[1]) + suffix,
+            )
             return
 
         returncode = int(event[1])
@@ -884,16 +1228,33 @@ class CorrelationApp:
                 style="Warn.TLabel",
             )
             self._status_bar.configure(text="correlation worker: failed")
+            log_path = self._write_failure_log()
+            suffix = f"\n\nLog saved to:\n{log_path}" if log_path else ""
             self.messagebox.showerror(
                 "Correlation run failed",
-                f"Worker return code {returncode}. See View log for details.",
+                f"Worker return code {returncode}. See View log for details."
+                + suffix,
             )
         else:
-            self.run_status.configure(
-                text="Correlation run complete.", style="Ok.TLabel",
-            )
+            manifest: Dict[str, Any] = {}
+            if active_result_root is not None:
+                manifest = read_json(
+                    Path(active_result_root) / f"manifest_{sample_type}.json"
+                )
+            if manifest:
+                artifact = str(manifest.get("correlations_h5", "") or "")
+                if artifact:
+                    self.config["correlations_h5"] = artifact
+                    try:
+                        self.save_config(silent=True)
+                    except Exception:
+                        pass
+                summary = self._completion_summary(manifest)
+            else:
+                summary = "Correlation run complete."
+            self.run_status.configure(text=summary, style="Ok.TLabel")
             self._status_bar.configure(text="correlation worker: done")
-            self.log("Correlation run complete")
+            self.log(summary)
             self.review_results(
                 show_errors=False,
                 result_root=active_result_root,
@@ -931,6 +1292,22 @@ class CorrelationApp:
                 delay_ms, self._apply_result_filters
             )
 
+    def _open_results_folder(self):
+        folder = self._review_result_root
+        if folder is None:
+            self.pull_vars()
+            raw = str(self.config.get("result_root", "") or "").strip()
+            folder = Path(raw).expanduser() if raw else None
+        if folder is None or not Path(folder).is_dir():
+            self.messagebox.showinfo(
+                "Correlation results", "No result folder to open yet.",
+            )
+            return
+        try:
+            open_in_file_manager(folder)
+        except Exception as exc:
+            self.messagebox.showerror("Could not open folder", str(exc))
+
     def _clear_result_browser(self, status: str, preview: str) -> None:
         """Clear stale results when the selected result folder cannot be read."""
 
@@ -957,6 +1334,24 @@ class CorrelationApp:
             except Exception:
                 pass
         tree = self.results_tree
+
+        query_var = getattr(self, "_result_search_var", None)
+        category_var = getattr(self, "_result_category_var", None)
+        query = str(query_var.get() if query_var is not None else "")
+        category_filter = str(
+            category_var.get() if category_var is not None else RESULT_FILTER_ALL
+        )
+        # Rebuilding the Treeview is the expensive part; skip it entirely
+        # when neither the filters nor the entry index changed (repeated
+        # triggers from <Configure>, duplicate traces, ...).
+        signature = (
+            query, category_filter,
+            id(self._result_entries), len(self._result_entries),
+        )
+        if signature == self._last_filter_signature:
+            return
+        self._last_filter_signature = signature
+
         selected_path = None
         selected = tree.selection()
         if selected:
@@ -965,16 +1360,13 @@ class CorrelationApp:
             tree.delete(item)
         self._result_paths.clear()
 
-        query_var = getattr(self, "_result_search_var", None)
-        category_var = getattr(self, "_result_category_var", None)
-        query = str(query_var.get() if query_var is not None else "")
-        category_filter = str(
-            category_var.get() if category_var is not None else RESULT_FILTER_ALL
-        )
         visible = [
             entry for entry in self._result_entries
             if _result_matches(entry, query, category_filter)
         ]
+        truncated = len(visible) > MAX_RESULT_LEAVES
+        if truncated:
+            visible = visible[:MAX_RESULT_LEAVES]
 
         groups: "dict[tuple[str, str], str]" = {}
 
@@ -1031,6 +1423,10 @@ class CorrelationApp:
             if shown == total and not query.strip() and category_filter == RESULT_FILTER_ALL
             else f"{shown} of {total} correlation diagram PNG file(s)"
         )
+        if truncated:
+            status += (
+                f" (showing the first {MAX_RESULT_LEAVES} — narrow the search)"
+            )
         self.results_status.configure(text=status)
         self._preview_photo = None
         self.preview_path_label.configure(text="")
@@ -1148,11 +1544,27 @@ class CorrelationApp:
 
             width = max(320, int(self._preview_frame.winfo_width()) - 24)
             height = max(240, int(self._preview_frame.winfo_height()) - 56)
-            with Image.open(path) as source:
-                image = source.convert("RGB")
+            key = (str(path), path.stat().st_mtime_ns)
+            last = self._preview_last
+            if (
+                last is not None
+                and last[0] == key
+                and abs(last[1] - width) <= 4
+                and abs(last[2] - height) <= 4
+                and self._preview_photo is not None
+            ):
+                return  # same image at effectively the same size
+            cache = self._preview_cache
+            if cache is None or cache[0] != key:
+                # Decode from disk only when the file itself changed.
+                with Image.open(path) as source:
+                    decoded = source.convert("RGB")
+                self._preview_cache = cache = (key, decoded)
+            image = cache[1].copy()
             resampling = getattr(Image, "Resampling", Image).LANCZOS
             image.thumbnail((width, height), resampling)
             photo = ImageTk.PhotoImage(image, master=self.root)
+            self._preview_last = (key, width, height)
         except Exception as exc:
             self.preview_label.configure(
                 image="", text=f"Could not preview image:\n{exc}",
