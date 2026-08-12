@@ -592,7 +592,10 @@ def render_all(
 
     output_parent = source.parent
     final_files = [destination / path.relative_to(staging) for path in staged_files]
-    return [str(path.relative_to(output_parent)) for path in final_files]
+    # POSIX-normalized: these relative paths land in a JSON manifest that must
+    # read the same whoever opens it, and pathlib accepts forward slashes on
+    # every platform when joining them back onto the output directory.
+    return [path.relative_to(output_parent).as_posix() for path in final_files]
 
 
 __all__ = ["render_all"]

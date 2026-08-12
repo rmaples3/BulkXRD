@@ -328,3 +328,11 @@ standardized (`core/provenance.manifest_provenance`):
 
 `seriesxrd_version` is the package version that wrote the artifact;
 `schema_version` only changes when the file layout changes.
+
+Manifest fields listing generated files (the correlation stage's
+`plot_files` and `csv_files`) hold paths relative to the run's output
+directory, written with forward slashes on every platform so the manifest
+reads identically wherever it was produced; `pathlib` joins them back onto
+the output directory unchanged on Windows too. Absolute paths recorded for
+provenance (`analysis_h5`, `out_dir`, `correlations_h5`) stay in the writing
+host's native form.

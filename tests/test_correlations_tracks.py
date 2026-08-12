@@ -39,6 +39,9 @@ def test_end_to_end_tracks_two_drifting_peaks(tmp_path):
     assert manifest["tracks"]["n_tracks"] == 2
     assert manifest["tracks"]["n_track_obs"] == 8
     assert manifest["tracks"]["exploratory"] is True
+    # Manifest path lists are POSIX-normalized so the artifact reads the same
+    # on every platform (a native-separator list failed only on Windows).
+    assert all("\\" not in entry for entry in manifest["plot_files"])
     assert any(f.endswith("tracks/tracks.png") for f in manifest["plot_files"])
     assert (out / "heatmaps" / "powder" / "tracks" / "tracks.png").is_file()
 

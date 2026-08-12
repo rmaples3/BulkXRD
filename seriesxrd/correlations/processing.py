@@ -1534,7 +1534,7 @@ def run_correlations(
         "plots_written": len(plot_files),
         "plot_files": list(plot_files),
         "csv_files": [
-            str(path.relative_to(destination)) for path in csv_files
+            path.relative_to(destination).as_posix() for path in csv_files
         ],
     }
     write_json(destination / f"manifest_{sample}.json", manifest)
