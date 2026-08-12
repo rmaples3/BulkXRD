@@ -28,6 +28,8 @@ def _run(args: argparse.Namespace) -> int:
             track_link_tol_fwhm=args.track_link_tol_fwhm,
             track_max_gap=args.track_max_gap,
             track_group_by=args.track_group_by,
+            export_csv=args.export_csv,
+            export_matrix_csv=args.export_matrices,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"[ERROR] correlation generation failed: {exc}", flush=True)
@@ -170,6 +172,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         choices=("none", "scan", "folder"),
         help="Link tracks only within these frame groups (default: none).",
+    )
+    parser.add_argument(
+        "--export-csv",
+        action="store_true",
+        help=(
+            "Also write summary CSVs (per-anchor top matches, long-format "
+            "window tables, tracks, transition intervals) under <out>/csv."
+        ),
+    )
+    parser.add_argument(
+        "--export-matrices",
+        action="store_true",
+        help="Also dump the full K x K ROI/location matrices as CSV.",
     )
     return parser
 

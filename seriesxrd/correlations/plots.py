@@ -36,6 +36,25 @@ def _atomic_save(fig, path: Path) -> None:
         fig.clear()
 
 
+def _normalize_trace(raw: np.ndarray) -> np.ndarray:
+    """Per-frame waterfall normalization shared with analysis.stackplot.
+
+    The scale is the max of a median-filtered copy floored by the MAD noise,
+    so a 1-2 bin zinger cannot flatten the whole trace the way a plain
+    percentile scale could. NaN bins stay NaN.
+    """
+
+    from ..analysis.stackplot import mad_noise, robust_amp
+
+    values = np.asarray(raw, dtype=float)
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return np.full_like(values, np.nan)
+    scale = max(robust_amp(values), 10.0 * mad_noise(values),
+                np.finfo(float).eps)
+    return np.where(finite, np.clip(values, 0.0, None) / scale, np.nan)
+
+
 def _safe_pressure(value: float) -> str:
     if not np.isfinite(value):
         return "pressure_unknown"
@@ -142,11 +161,7 @@ def _waterfall(
     offset_step = 1.15
 
     for frame in range(n_frames):
-        raw = np.asarray(original_positive[frame], dtype=float)
-        finite = np.isfinite(raw)
-        scale = float(np.nanpercentile(raw[finite], 99.0)) if np.any(finite) else 0.0
-        scale = max(scale, np.finfo(float).eps)
-        trace = np.where(finite, np.clip(raw, 0.0, None) / scale, np.nan)
+        trace = _normalize_trace(original_positive[frame])
         offset = frame * offset_step
         ax.plot(radial, trace + offset, color="#4c566a", linewidth=0.65, zorder=2)
         targets = np.nonzero(peak_frame == frame)[0]

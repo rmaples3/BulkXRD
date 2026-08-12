@@ -101,7 +101,14 @@ def _finite_positive(values: np.ndarray) -> np.ndarray:
 
 
 def _estimate_noise_floor(values: np.ndarray) -> float:
-    """Robust white-noise estimate from first differences, pooled by frame."""
+    """Robust white-noise estimate from first differences, pooled by frame.
+
+    Deliberately NOT consolidated with peaks.mad_sigma or
+    stackplot.mad_noise: those are value-MADs (they include background
+    structure), while a first-difference MAD isolates the white-noise sigma
+    that the Log2 epsilon floor needs; staying local also keeps this module
+    import-light.
+    """
 
     array = np.atleast_2d(np.asarray(values, dtype=float))
     estimates = []
@@ -1249,6 +1256,8 @@ def run_correlations(
     track_link_tol_fwhm: float = 1.5,
     track_max_gap: int = 2,
     track_group_by: str = "none",
+    export_csv: bool = False,
+    export_matrix_csv: bool = False,
 ) -> Dict[str, Any]:
     """Generate the complete MVP correlation artifact and optional figures.
 
@@ -1448,6 +1457,17 @@ def run_correlations(
             destination / "heatmaps",
             max_anchor_plots=max_anchor_plots,
         )
+    csv_files: list = []
+    if export_csv or export_matrix_csv:
+        from . import export as _export
+
+        csv_dir = destination / "csv"
+        if export_csv:
+            csv_files.extend(
+                _export.export_summary_csvs(h5_path, csv_dir)
+            )
+        if export_matrix_csv:
+            csv_files.extend(_export.export_matrices(h5_path, csv_dir))
     manifest = {
         **manifest_provenance(TOOL, SCHEMA_VERSION),
         "analysis_h5": str(analysis_path),
@@ -1513,6 +1533,9 @@ def run_correlations(
         ),
         "plots_written": len(plot_files),
         "plot_files": list(plot_files),
+        "csv_files": [
+            str(path.relative_to(destination)) for path in csv_files
+        ],
     }
     write_json(destination / f"manifest_{sample}.json", manifest)
     return manifest

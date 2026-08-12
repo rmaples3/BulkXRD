@@ -162,6 +162,22 @@ def test_waterfall_height_capped(tmp_path, monkeypatch):
     assert heights[1] == pytest.approx(0.55 * 6 + 2.2)
 
 
+def test_waterfall_normalization_resists_zingers():
+    """A 1-2 bin spike cannot flatten the trace: the stackplot-shared robust
+    scale wins over any percentile of the raw values."""
+    radial = np.linspace(0.0, 4.0, 200)
+    signal = 1.0 + np.exp(-0.5 * ((radial - 2.0) / 0.1) ** 2) * 5.0
+    spiked = signal.copy()
+    spiked[50] = 5000.0                      # single-bin zinger
+
+    clean_trace = plots._normalize_trace(signal)
+    spiked_trace = plots._normalize_trace(spiked)
+    # The real peak keeps essentially its full height despite the zinger.
+    peak_bin = int(np.argmax(signal))
+    assert spiked_trace[peak_bin] > 0.8 * clean_trace[peak_bin]
+    assert np.isnan(plots._normalize_trace(np.full(5, np.nan))).all()
+
+
 def test_anchor_plot_cap_and_validity_skip(tmp_path):
     """max_anchor_plots caps per-anchor PNGs deterministically; the HDF5
     matrices stay complete."""

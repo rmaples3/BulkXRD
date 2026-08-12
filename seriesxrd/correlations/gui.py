@@ -690,6 +690,9 @@ class CorrelationApp:
         ttk.Button(
             toolbar, text="Open folder", command=self._open_results_folder,
         ).pack(side="left", padx=2)
+        ttk.Button(
+            toolbar, text="Export CSV…", command=self._export_csv_clicked,
+        ).pack(side="left", padx=2)
         self.results_status = ttk.Label(
             toolbar, text="No results loaded.", style="Muted.TLabel",
         )
@@ -1135,6 +1138,8 @@ class CorrelationApp:
                 try:
                     if event[0] == "progress":
                         self._update_progress(int(event[1]), int(event[2]))
+                    elif event[0] in ("csv_done", "csv_error"):
+                        self._handle_csv_event(event)
                     else:
                         self._handle_worker_event(event)
                 except Exception as exc:
@@ -1307,6 +1312,62 @@ class CorrelationApp:
             open_in_file_manager(folder)
         except Exception as exc:
             self.messagebox.showerror("Could not open folder", str(exc))
+
+    def _export_csv_clicked(self):
+        """Write the summary CSV set for the reviewed artifact, off-thread."""
+        root = self._review_result_root
+        if root is None:
+            self.pull_vars()
+            raw = str(self.config.get("result_root", "") or "").strip()
+            root = Path(raw).expanduser() if raw else None
+        if root is None or not Path(root).is_dir():
+            self.messagebox.showinfo(
+                "Correlation results", "Run correlations first.",
+            )
+            return
+        sample_type = str(self.config.get("sample_type", "powder") or "powder")
+        artifact = Path(root) / f"correlations_{sample_type}.h5"
+        if not artifact.is_file():
+            others = [
+                Path(root) / f"correlations_{candidate}.h5"
+                for candidate in SAMPLE_TYPES
+                if (Path(root) / f"correlations_{candidate}.h5").is_file()
+            ]
+            if not others:
+                self.messagebox.showinfo(
+                    "Correlation results",
+                    "No correlation HDF5 found in the result folder yet.",
+                )
+                return
+            artifact = others[0]
+        target = self.filedialog.askdirectory(
+            title="Export summary CSVs into",
+            initialdir=str(Path(root) / "csv"),
+        ) or ""
+        if not target:
+            return
+        self.results_status.configure(text="Exporting CSVs…")
+
+        def _export(source=artifact, destination=target):
+            try:
+                from .export import export_summary_csvs
+
+                written = export_summary_csvs(source, destination)
+                self._event_queue.put(("csv_done", len(written), destination))
+            except Exception as exc:
+                self._event_queue.put(("csv_error", str(exc)))
+
+        threading.Thread(target=_export, daemon=True).start()
+
+    def _handle_csv_event(self, event: tuple):
+        if event[0] == "csv_done":
+            self.results_status.configure(
+                text=f"Exported {event[1]} CSV file(s) to {event[2]}",
+            )
+            self.log(f"CSV export complete: {event[1]} file(s) in {event[2]}")
+        else:
+            self.results_status.configure(text="CSV export failed.")
+            self.messagebox.showerror("CSV export failed", str(event[1]))
 
     def _clear_result_browser(self, status: str, preview: str) -> None:
         """Clear stale results when the selected result folder cannot be read."""
