@@ -22,6 +22,12 @@ def _run(args: argparse.Namespace) -> int:
             make_plots=not args.no_plots,
             max_anchor_plots=args.max_anchor_plots,
             order_by=args.order_by,
+            make_tracks=not args.no_tracks,
+            track_min_similarity=args.track_min_similarity,
+            track_min_frames=args.track_min_frames,
+            track_link_tol_fwhm=args.track_link_tol_fwhm,
+            track_max_gap=args.track_max_gap,
+            track_group_by=args.track_group_by,
         )
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"[ERROR] correlation generation failed: {exc}", flush=True)
@@ -126,6 +132,44 @@ def build_parser() -> argparse.ArgumentParser:
             "(first N in id order); every matrix stays complete in the HDF5. "
             "Default: no cap."
         ),
+    )
+    parser.add_argument(
+        "--no-tracks",
+        action="store_true",
+        help="Skip ROI-gated peak-track linking and transition screening.",
+    )
+    parser.add_argument(
+        "--track-min-similarity",
+        type=float,
+        default=0.2,
+        help=(
+            "Mutual ROI-similarity gate for linking two peaks into a track "
+            "(0 disables the gate: pure positional linking; default 0.2)."
+        ),
+    )
+    parser.add_argument(
+        "--track-min-frames",
+        type=int,
+        default=3,
+        help="Discard tracks observed in fewer frames than this (default 3).",
+    )
+    parser.add_argument(
+        "--track-link-tol-fwhm",
+        type=float,
+        default=1.5,
+        help="Position gate in units of max(track, peak) width (default 1.5).",
+    )
+    parser.add_argument(
+        "--track-max-gap",
+        type=int,
+        default=2,
+        help="Missing ordered samples a track may skip before it closes.",
+    )
+    parser.add_argument(
+        "--track-group-by",
+        default="none",
+        choices=("none", "scan", "folder"),
+        help="Link tracks only within these frame groups (default: none).",
     )
     return parser
 

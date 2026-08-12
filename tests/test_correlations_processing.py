@@ -33,6 +33,7 @@ def _write_analysis(
     excluded_idx: tuple = (),
     edge_peak: bool = False,
     pressures: "tuple | None" = None,
+    extra_peaks: tuple = (),
 ) -> Path:
     radial = np.linspace(0.0, 10.0, 241)
     n_frames = 4
@@ -42,6 +43,8 @@ def _write_analysis(
     if edge_peak:
         # Center inside the axis but ROI support [-0.2, 0.4] crossing radial[0].
         peak_rows.append((0, 0.1, 0.4, 2.0))
+    for frame, center, width, area in extra_peaks:
+        peak_rows.append((frame, center, width, area))
     for frame in range(n_frames):
         shift = 0.03 * frame
         clean[frame] = (
@@ -49,6 +52,9 @@ def _write_analysis(
             + _gaussian(radial, 2.0 + shift, 0.10, 8.0 + frame)
             + _gaussian(radial, 6.0 - shift, 0.16, 5.0 + 0.5 * frame)
         )
+        for extra_frame, center, width, area in extra_peaks:
+            if extra_frame == frame:
+                clean[frame] += _gaussian(radial, center, 0.4 * width, area)
         for center, width, area in (
             (2.0 + shift, 0.24, 8.0 + frame),
             (6.0 - shift, 0.32, 5.0 + frame),

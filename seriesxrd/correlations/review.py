@@ -47,6 +47,18 @@ def inspect_correlations(path: str | Path) -> Dict[str, Any]:
                 result["n_anchors_valid"] = int(
                     np.count_nonzero(np.asarray(h5["peaks/valid"][:], bool))
                 )
+            # Same for /tracks: older or --no-tracks artifacts open cleanly.
+            if "tracks" in h5:
+                result["n_tracks"] = int(h5["tracks"].attrs.get("n_tracks", 0))
+                if "tracks/intervals/transition_candidate" in h5:
+                    result["n_transition_candidates"] = int(
+                        np.count_nonzero(
+                            np.asarray(
+                                h5["tracks/intervals/transition_candidate"][:],
+                                bool,
+                            )
+                        )
+                    )
             required = (
                 "patterns/original_positive",
                 "patterns/log_squared",

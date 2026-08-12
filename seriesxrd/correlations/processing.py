@@ -1016,6 +1016,9 @@ def _write_h5(
     location: np.ndarray,
     windows: Mapping[str, np.ndarray],
     config: Mapping[str, Any],
+    tracks_bundle: Optional[Mapping[str, Any]] = None,
+    intervals: Optional[Mapping[str, np.ndarray]] = None,
+    track_group_labels: Optional[Sequence[str]] = None,
 ) -> None:
     import h5py  # type: ignore
 
@@ -1181,6 +1184,43 @@ def _write_h5(
                 "structurally invalid signals/fingerprints remain NaN"
             )
 
+            if tracks_bundle is not None:
+                from .tracks import TRANSITION_RULE
+
+                track_h5 = h5.create_group("tracks")
+                track_h5.attrs.update(
+                    {
+                        "linker": "seriesxrd.analysis.unknowns.link_tracks",
+                        "similarity": "mutual_sqrt_directional_roi",
+                        "exploratory": True,
+                        "transition_rule": TRANSITION_RULE,
+                        "n_tracks": int(
+                            tracks_bundle["summary"]["id"].size
+                        ),
+                        "group_by": str(config.get("track_group_by", "none")),
+                    }
+                )
+                track_h5.attrs.update(tracks_bundle["settings"])
+                obs_h5 = track_h5.create_group("obs")
+                for name, values in tracks_bundle["obs"].items():
+                    _create_dataset(obs_h5, name, values)
+                summary_h5 = track_h5.create_group("summary")
+                for name, values in tracks_bundle["summary"].items():
+                    _create_dataset(summary_h5, name, values)
+                edges_h5 = track_h5.create_group("edges")
+                for name, values in tracks_bundle["edges"].items():
+                    _create_dataset(edges_h5, name, values)
+                if intervals is not None:
+                    interval_h5 = track_h5.create_group("intervals")
+                    for name, values in intervals.items():
+                        _create_dataset(interval_h5, name, values)
+                if track_group_labels:
+                    track_h5.create_dataset(
+                        "group_label",
+                        data=np.asarray(list(track_group_labels), object),
+                        dtype=h5py.string_dtype(encoding="utf-8"),
+                    )
+
         os.replace(tmp, path)
     except Exception:
         if tmp.exists():
@@ -1203,6 +1243,12 @@ def run_correlations(
     make_plots: bool = True,
     max_anchor_plots: Optional[int] = None,
     order_by: str = "frame",
+    make_tracks: bool = True,
+    track_min_similarity: float = 0.2,
+    track_min_frames: int = 3,
+    track_link_tol_fwhm: float = 1.5,
+    track_max_gap: int = 2,
+    track_group_by: str = "none",
 ) -> Dict[str, Any]:
     """Generate the complete MVP correlation artifact and optional figures.
 
@@ -1259,6 +1305,20 @@ def run_correlations(
         patterns = patterns[:, radial_keep]
         unit = _decode(source_h5.attrs.get("unit", "radial"))
         peaks = _read_peaks(source_h5, sample, frames, radial)
+        track_group_key, track_group_ids, track_group_labels = (
+            "none", None, ["all"]
+        )
+        if make_tracks:
+            from ..analysis.series import tracking_groups
+
+            track_group_key, group_ids_all, track_group_labels = (
+                tracking_groups(
+                    source_h5, track_group_by, int(frames["keep"].size)
+                )
+            )
+            track_group_ids = np.asarray(group_ids_all, dtype=int)[
+                frames["original_index"]
+            ]
 
     original_positive = np.where(
         np.isfinite(patterns), np.clip(patterns, 0.0, None), np.nan
@@ -1297,6 +1357,37 @@ def run_correlations(
         window_width=float(window_width),
         window_step=float(window_step),
     )
+    tracks_bundle = None
+    intervals = None
+    if make_tracks:
+        from .tracks import build_tracks, transition_summary
+
+        n_kept = int(original_positive.shape[0])
+        axis_used = (
+            np.arange(n_kept, dtype=float)
+            if frames["order_by"] == "frame"
+            else np.asarray(frames["order_values"], dtype=float)
+        )
+        tracks_bundle = build_tracks(
+            peaks,
+            roi_area,
+            n_frames=n_kept,
+            order_key=frames["order_by"],
+            order_values=frames["order_values"],
+            group_ids=track_group_ids,
+            link_tol_fwhm=float(track_link_tol_fwhm),
+            max_gap=int(track_max_gap),
+            min_track_frames=int(track_min_frames),
+            min_roi_similarity=float(track_min_similarity),
+        )
+        intervals = transition_summary(
+            tracks_bundle,
+            n_frames=n_kept,
+            order_key=frames["order_by"],
+            order_values=axis_used,
+            group_ids=track_group_ids,
+            across_direct=windows["across_direct"],
+        )
     config = {
         "sample_type": sample,
         "source": source_requested,
@@ -1312,6 +1403,12 @@ def run_correlations(
             None if max_anchor_plots is None else int(max_anchor_plots)
         ),
         "order_by": frames["order_by"],
+        "make_tracks": bool(make_tracks),
+        "track_min_similarity": float(track_min_similarity),
+        "track_min_frames": int(track_min_frames),
+        "track_link_tol_fwhm": float(track_link_tol_fwhm),
+        "track_max_gap": int(track_max_gap),
+        "track_group_by": str(track_group_key),
     }
     h5_path = destination / f"correlations_{sample}.h5"
     _write_h5(
@@ -1337,6 +1434,9 @@ def run_correlations(
         location=location,
         windows=windows,
         config=config,
+        tracks_bundle=tracks_bundle,
+        intervals=intervals,
+        track_group_labels=track_group_labels,
     )
 
     plot_files: Sequence[str] = ()
@@ -1387,9 +1487,29 @@ def run_correlations(
             "window_across_direct",
             "window_across_acf",
             "window_within_acf",
-        ] + (["waterfall"] if make_plots else []),
+        ]
+        + (["tracks"] if tracks_bundle is not None else [])
+        + (["waterfall"] if make_plots else []),
         "anchor_plot_cap": (
             None if max_anchor_plots is None else int(max_anchor_plots)
+        ),
+        "tracks": (
+            None
+            if tracks_bundle is None
+            else {
+                "n_tracks": int(tracks_bundle["summary"]["id"].size),
+                "n_track_obs": int(tracks_bundle["obs"]["track"].size),
+                "n_transition_candidates": (
+                    0
+                    if intervals is None
+                    else int(
+                        np.count_nonzero(intervals["transition_candidate"])
+                    )
+                ),
+                **tracks_bundle["settings"],
+                "group_by": str(track_group_key),
+                "exploratory": True,
+            }
         ),
         "plots_written": len(plot_files),
         "plot_files": list(plot_files),

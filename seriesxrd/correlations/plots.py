@@ -7,6 +7,7 @@ subprocess with no display server.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -203,6 +204,69 @@ def _waterfall(
     _atomic_save(fig, path)
 
 
+def _track_map(
+    path: Path,
+    *,
+    obs_x: np.ndarray,
+    obs_y: np.ndarray,
+    obs_track: np.ndarray,
+    edge_x: np.ndarray,
+    edge_y: np.ndarray,
+    edge_similarity: np.ndarray,
+    band_from: np.ndarray,
+    band_to: np.ndarray,
+    x_label: str,
+    y_label: str,
+    group_label: str,
+) -> None:
+    """Peak-position-vs-condition track plot, edges colored by similarity.
+
+    Exploratory transition-candidate intervals are drawn as translucent
+    vertical bands. Same viridis 0..1 convention as the waterfall shading.
+    """
+
+    Figure, FigureCanvasAgg, Normalize = _mpl()
+    from matplotlib import colormaps
+    from matplotlib.cm import ScalarMappable
+
+    fig = Figure(figsize=(9.5, 6.0), facecolor="white")
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    cmap = colormaps["viridis"]
+    norm = Normalize(vmin=0.0, vmax=1.0)
+
+    for lo, hi in zip(band_from, band_to):
+        ax.axvspan(float(lo), float(hi), color="#bf616a", alpha=0.14, zorder=1)
+    for (x0, x1), (y0, y1), score in zip(
+        edge_x.reshape(-1, 2), edge_y.reshape(-1, 2), edge_similarity
+    ):
+        color = cmap(norm(score)) if np.isfinite(score) else "#c8c8c8"
+        ax.plot([x0, x1], [y0, y1], color=color, linewidth=1.4, zorder=2)
+    ax.scatter(obs_x, obs_y, s=9, color="#4c566a", zorder=3)
+    for track_id in np.unique(obs_track):
+        member = obs_track == track_id
+        xs = obs_x[member]
+        ys = obs_y[member]
+        ax.scatter([xs[0]], [ys[0]], marker="^", s=34, color="#a3be8c",
+                   zorder=4, linewidths=0)
+        ax.scatter([xs[-1]], [ys[-1]], marker="v", s=34, color="#bf616a",
+                   zorder=4, linewidths=0)
+
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(
+        f"ROI-gated peak tracks ({group_label}); ▲ birth, ▼ death, "
+        "bands = exploratory transition candidates",
+        fontsize=10,
+    )
+    ax.grid(color="#d8dee9", linewidth=0.5)
+    scalar = ScalarMappable(norm=norm, cmap=cmap)
+    scalar.set_array([])
+    colorbar = fig.colorbar(scalar, ax=ax, pad=0.02)
+    colorbar.set_label("mutual Log-squared ROI similarity", fontsize=8)
+    _atomic_save(fig, path)
+
+
 def _render_into(
     correlations_h5: Path,
     base: Path,
@@ -237,6 +301,44 @@ def _render_into(
         across_direct = np.asarray(h5["windows/across_direct"][:], float)
         across_acf = np.asarray(h5["windows/across_acf"][:], float)
         within_acf = np.asarray(h5["windows/within_acf"][:], float)
+        # Track data is optional: --no-tracks runs and older artifacts.
+        tracks = None
+        if "tracks" in h5 and "tracks/summary/id" in h5:
+            order_by = str(h5.attrs.get("order_by", "frame"))
+            tracks = {
+                "order_by": order_by,
+                "order_label": str(h5.attrs.get("order_label", "Frame index")),
+                "obs_track": np.asarray(h5["tracks/obs/track"][:], int),
+                "obs_peak": np.asarray(h5["tracks/obs/peak_id"][:], int),
+                "edge_track": np.asarray(h5["tracks/edges/track"][:], int),
+                "edge_from": np.asarray(h5["tracks/edges/peak_from"][:], int),
+                "edge_to": np.asarray(h5["tracks/edges/peak_to"][:], int),
+                "edge_similarity": np.asarray(
+                    h5["tracks/edges/similarity"][:], float
+                ),
+                "summary_group": np.asarray(h5["tracks/summary/group"][:], int),
+            }
+            for name in (
+                "axis_from", "axis_to", "group", "transition_candidate",
+            ):
+                key = f"tracks/intervals/{name}"
+                tracks[f"interval_{name}"] = (
+                    np.asarray(h5[key][:]) if key in h5 else np.empty(0)
+                )
+            if "tracks/group_label" in h5:
+                tracks["group_labels"] = [
+                    value.decode("utf-8", "replace")
+                    if isinstance(value, bytes)
+                    else str(value)
+                    for value in h5["tracks/group_label"][:]
+                ]
+            else:
+                tracks["group_labels"] = []
+            tracks["order_value"] = (
+                np.asarray(h5["frames/order_value"][:], float)
+                if "frames/order_value" in h5
+                else np.arange(original.shape[0], dtype=float)
+            )
 
     plot_anchor = anchor_valid.copy()
     if max_anchor_plots is not None:
@@ -244,12 +346,19 @@ def _render_into(
         selected = np.nonzero(anchor_valid)[0][: max(int(max_anchor_plots), 0)]
         plot_anchor = np.zeros_like(anchor_valid)
         plot_anchor[selected] = True
+    track_groups: List[int] = []
+    if tracks is not None and tracks["obs_track"].size:
+        track_groups = sorted(
+            int(g)
+            for g in np.unique(tracks["summary_group"][tracks["obs_track"]])
+        )
     n_selected = int(np.count_nonzero(plot_anchor))
     planned = (
         3 * n_selected
         + across_direct.shape[0]
         + across_acf.shape[0]
         + within_acf.shape[0]
+        + len(track_groups)
     )
 
     files: List[Path] = []
@@ -347,6 +456,73 @@ def _render_into(
         )
         files.append(path)
         _tick()
+
+    if tracks is not None and track_groups:
+        if tracks["order_by"] == "frame":
+            axis_used = np.arange(original.shape[0], dtype=float)
+            x_label = "frame row"
+        else:
+            axis_used = tracks["order_value"]
+            x_label = tracks["order_label"]
+        obs_x_all = axis_used[peak_frame[tracks["obs_peak"]]]
+        obs_y_all = centers[tracks["obs_peak"]]
+        obs_group = tracks["summary_group"][tracks["obs_track"]]
+        edge_group = tracks["summary_group"][tracks["edge_track"]]
+        edge_x_all = np.column_stack(
+            (
+                axis_used[peak_frame[tracks["edge_from"]]],
+                axis_used[peak_frame[tracks["edge_to"]]],
+            )
+        )
+        edge_y_all = np.column_stack(
+            (centers[tracks["edge_from"]], centers[tracks["edge_to"]])
+        )
+        has_intervals = tracks["interval_group"].size > 0
+        interval_group = np.asarray(tracks["interval_group"], int)
+        interval_candidate = np.asarray(
+            tracks["interval_transition_candidate"], bool
+        )
+        for group_id in track_groups:
+            labels = tracks["group_labels"]
+            label = (
+                labels[group_id]
+                if 0 <= group_id < len(labels)
+                else f"group{group_id}"
+            )
+            safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+            name = (
+                "tracks.png"
+                if len(track_groups) == 1
+                else f"tracks_{safe}.png"
+            )
+            path = base / "tracks" / name
+            member = obs_group == group_id
+            edge_member = edge_group == group_id
+            if has_intervals:
+                band = (interval_group == group_id) & interval_candidate
+                band_from = np.asarray(
+                    tracks["interval_axis_from"], float
+                )[band]
+                band_to = np.asarray(tracks["interval_axis_to"], float)[band]
+            else:
+                band_from = np.empty(0)
+                band_to = np.empty(0)
+            _track_map(
+                path,
+                obs_x=obs_x_all[member],
+                obs_y=obs_y_all[member],
+                obs_track=tracks["obs_track"][member],
+                edge_x=edge_x_all[edge_member],
+                edge_y=edge_y_all[edge_member],
+                edge_similarity=tracks["edge_similarity"][edge_member],
+                band_from=band_from,
+                band_to=band_to,
+                x_label=x_label,
+                y_label=unit or "radial",
+                group_label=label,
+            )
+            files.append(path)
+            _tick()
 
     return files
 
