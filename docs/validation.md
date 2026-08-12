@@ -159,6 +159,14 @@ These outputs are for guidance and screening, not for quantitative claims:
   from missing data: a finite zero denominator scores `0`, including the
   single-crystal both-zero case (two dead ROIs share absence, not
   similarity).
+- **Tracks and transition intervals are exploratory.** Track linking reuses
+  the Step-3c linker with the mutual ROI similarity as a second gate; with the
+  gate unset that linker is pinned bit-identical to its historical behavior,
+  and the vectorized K×K ROI matrix is pinned cell-for-cell against the scalar
+  reference kernel. A flagged interval means coincident changes (births/deaths
+  or a robust across-window correlation drop, rule recorded in the artifact),
+  never a confirmed phase transition, and no structural assignment is ever
+  made from a correlation score.
 - **Pearson windows can be undefined.** A constant or structurally invalid
   window has no variance and is stored as `NaN`, not forced to zero. FFT-ACF
   fingerprints are standardized, use positive lags only, and exclude lag

@@ -137,7 +137,15 @@ Analysis background-corrected source
         -> independent geometric location maps
         -> original-positive waterfall + Log²-derived shading
         -> direct and standardized positive-lag FFT-ACF window correlations
+        -> ROI-gated peak tracks (analysis.unknowns.link_tracks + the mutual
+           ROI similarity as its evidence gate) + exploratory transition
+           screening
 ```
+
+`correlations/tracks.py` supplies the linking/screening layer and
+`correlations/export.py` the CSV exports; both are headless. The stage never
+grows a second track linker — the one in `analysis/unknowns.py` gained an
+optional similarity gate instead, inert for Step 3c.
 
 Powder anchors are the retained `/peaks` rows. Single-crystal anchors are the
 `/spots/obs` rows. Track identifiers may be recorded but never collapse the

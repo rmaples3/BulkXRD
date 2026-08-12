@@ -300,18 +300,29 @@ Four pages expose the same supported batch contract as `seriesxrd-correlate`:
 1. **Input** — the Analysis HDF5 and a workspace result folder. A completed
    Analysis run is handed here automatically by the unified application.
 2. **Settings** — `powder` or `single_crystal`, a baseline-free Analysis
-   profile source, optional radial bounds, window width/step, and the native-axis
-   tolerance for peak-location similarity. Single-crystal mode defaults to the
+   profile source, the frame ordering axis (`frame` keeps file order;
+   `pressure`/`temperature`/`time` order the series physically), optional
+   radial bounds, window width/step, the native-axis tolerance for
+   peak-location similarity, the pooled-scale quantile, PNG controls
+   (skip rendering, per-anchor plot cap), and the exploratory peak-track
+   knobs (ROI-similarity gate, minimum frames, position gate, frame-gap
+   tolerance, scan/folder grouping). Single-crystal mode defaults to the
    recommended `spots` source. Window width and step use the selected HDF5
-   radial unit, and width cannot exceed the selected radial span. The intensity
-   transform is fixed to Log².
-3. **Run correlations** — launches an isolated headless subprocess.
+   radial unit, and width cannot exceed the selected radial span. The
+   intensity transform is fixed to Log². Every setting is locked while a
+   run is live.
+3. **Run correlations** — launches an isolated headless subprocess and
+   streams its `[CORRELATIONS] done total` progress into a live progress
+   bar; on success the completion line summarizes frames, valid anchors,
+   windows, tracks, and PNGs from the run manifest.
 4. **Results** — provides a text search and a hierarchy of sample type →
    diagram type → pressure → image. ROI-area, location, and waterfall plots
    use the anchor pressure; within-frame window plots use the source frame's
    pressure. Across-frame window plots compare the full series and therefore
-   appear under **All pressures**. Selecting a leaf loads only that preview, so
-   large result sets do not all enter GUI memory at once.
+   appear under **All pressures**, as do the peak-track overviews.
+   Selecting a leaf loads only that preview, so large result sets do not all
+   enter GUI memory at once. **Open folder** reveals the result directory and
+   **Export CSV…** writes the summary CSV set for the reviewed artifact.
 
 The required upstream observation table depends on sample type. Powder uses
 every good row in `/peaks` (run Analysis Step 2). Single-crystal uses every row
@@ -357,13 +368,23 @@ The supported CLI mirrors the GUI:
 
 ```bash
 seriesxrd-correlate ANALYSIS.h5 --out RESULTS \
-    --sample-type powder --source fit \
+    --sample-type powder --source fit --order-by pressure \
     --radial-min 2.0 --radial-max 12.0 \
     --window-width 5.0 --window-step 1.0 \
-    --location-tolerance 0.02
+    --location-tolerance 0.02 --export-csv --max-anchor-plots 50
 ```
 
-Use `--no-plots` when only the sample-specific HDF5 and manifest are needed.
+Use `--no-plots` when only the sample-specific HDF5 and manifest are needed,
+`--max-anchor-plots N` to cap the per-anchor PNGs (the matrices stay complete
+in the HDF5), `--export-csv` / `--export-matrices` for spreadsheet-ready
+tables under `RESULTS/csv`, and `--no-tracks` to skip the exploratory
+ROI-gated peak tracks. Track linking reuses the Step-3c linker with the
+mutual ROI similarity `sqrt(S(A→B)·S(B→A))` as its evidence gate
+(`--track-min-similarity`, `0` = positional-only), links only within
+`--track-group-by` groups, and screens adjacent ordered intervals for
+coincident births/deaths and across-window correlation drops. Flagged
+intervals are exploratory candidates to inspect, never confirmed
+transitions.
 Powder writes `correlations_powder.h5` plus `manifest_powder.json`; single
 crystal writes `correlations_single_crystal.h5` plus
 `manifest_single_crystal.json`. Both numerical pairs safely coexist in one

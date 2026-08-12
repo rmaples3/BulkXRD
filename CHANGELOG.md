@@ -5,6 +5,92 @@ semantic versioning once a stable public API is declared.
 
 ## [Unreleased]
 
+### Added
+
+- **Correlations, a fourth pipeline stage** (`seriesxrd.correlations`, merged
+  from the Log²-only MVP and hardened here): reads the Analysis HDF5 and
+  writes a sample-specific `correlations_<sample>.h5` + manifest with a fixed
+  bounded Log² transform (one pooled scale and noise-derived epsilon),
+  directional ROI-area and geometric location anchor maps, correlation-shaded
+  waterfalls, and direct/FFT-ACF window correlations across and within
+  frames. Exposed as the unified app's fourth tab, `seriesxrd-correlate`, and
+  `seriesxrd-correlations-gui`; analysis hands a completed HDF5 off
+  automatically.
+- **ROI-gated peak tracks + exploratory transition screening**: the
+  correlation stage now links its all-peak table across the series by reusing
+  the one Step-3c linker — `analysis.unknowns.link_tracks` gained an optional
+  evidence gate (`similarity` callable + `min_similarity`, inert by default
+  and bit-identical for Step 3c) fed with the mutual ROI similarity
+  `sqrt(S(A→B)·S(B→A))`. Artifacts grow `/tracks` (observations, summaries,
+  similarity-scored edges, per-interval births/deaths/window-drop screening
+  with the decision rule recorded), a per-group track-overview PNG, and CLI
+  knobs (`--no-tracks`, `--track-min-similarity`, `--track-min-frames`,
+  `--track-link-tol-fwhm`, `--track-max-gap`, `--track-group-by`). Flagged
+  intervals are labeled exploratory candidates, never confirmed transitions.
+- **Frame ordering by metadata** (`--order-by frame|pressure|temperature|time`):
+  retained frames are stably sorted through the new public
+  `analysis.series` helpers (promoted from unknowns; Step-2 seed propagation
+  now imports them there too), so waterfall rows, window frame axes, and peak
+  tracks all follow the physical series; `/frames/order_value` and
+  `order_by`/`order_label` attrs record it.
+- **CSV export** (`--export-csv`, `--export-matrices`, and an Export CSV…
+  button): per-anchor top-N ROI matches, long-format across/within window
+  tables, track summaries/observations, transition intervals, and on-demand
+  full K×K matrix dumps, written through `core.io.write_table_csv` and listed
+  in the manifest.
+- **Anchor validity** (`/peaks/valid` + manifest counts): anchors whose ROI
+  support crosses the radial boundary or contains a masked bin are flagged,
+  skipped in per-anchor plots, and reported instead of silently producing
+  blank maps.
+- **Progress protocol + GUI progress bar**: the stage streams
+  `[CORRELATIONS] <done> <total>` during scoring and rendering; the GUI shows
+  a live bar, reads the run manifest on success (recording
+  `correlations_h5` into the session config), and summarizes frames/anchors/
+  windows/tracks/PNGs/elapsed. `--max-anchor-plots` caps per-anchor PNGs.
+
+### Fixed
+
+- **Streaming progress for Steps 1/2/3a restored**: the shared
+  `process_map_or_serial` helper materialized `list(executor.map(...))`, so
+  the `[ANALYSIS]`/`[PEAKS]`/`[IDENTIFY]` progress lines all fired after the
+  work finished and the GUI bar jumped 0→100. It now yields lazily in payload
+  order, and its serial fallback catches only pool-construction/submission
+  `OSError` — worker errors propagate immediately instead of being mislabeled
+  "process pool unavailable" and recomputed serially before failing.
+- **One zero-signal convention for ROI scores**: two all-zero single-crystal
+  ROIs scored a perfect 1.0 (a masked/empty region read as maximal
+  similarity) and `integrated_iou` returned NaN for a finite zero
+  denominator; both now score 0, with NaN reserved for structural
+  invalidity.
+- **Masked bins are structural in the ROI path**: a non-finite native bin
+  inside an anchor support (or the support overlap, for the target) voids the
+  comparison instead of being bridged by interpolation, matching the window
+  rule the module already documented.
+- **Correlations GUI hardening**: the queue poll loop survives a failing
+  handler (previously one `TclError` killed it silently and the GUI never
+  learned the run finished); the worker launch honors the configured
+  `python_exe`/`backend_dir` with `cwd` at the checkout root so it works from
+  an uninstalled source tree; settings are locked during a run; failed runs
+  persist a log tail under `logs_root`; the Results browser skips redundant
+  tree rebuilds, caps rendered leaves, caches the decoded preview image, and
+  gains Open-folder; session seeding adds the `backend_dir`/`logs_root` keys
+  every other stage seeds.
+- **Waterfall figures bounded and zinger-proof**: per-anchor waterfall height
+  is capped at 18 in (a 200-frame series previously rendered 15 000-px-tall
+  PNGs) and traces share `analysis.stackplot`'s robust normalization instead
+  of a 99th-percentile scale a single hot bin could flatten.
+- Unique staging-file names for the correlation HDF5 so concurrent
+  same-sample runs cannot clobber each other's temp file.
+
+### Changed
+
+- **The K×K ROI matrix is vectorized**: one closed-form pass per anchor over
+  all targets replaces K² Python kernel calls (measured 1.6 s where the
+  scalar loop extrapolates to ~12 min at K=900), pinned cell-for-cell against
+  the unchanged scalar reference. Pairwise Pearson uses one Gram matrix, the
+  window ACFs one batched FFT, and window resampling one weight vector per
+  window — each with a loop-reference equality test.
+
 ## [0.4.0] - 2026-07-29
 
 ### Fixed

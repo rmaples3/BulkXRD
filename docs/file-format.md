@@ -192,7 +192,7 @@ positive-lag fingerprint length from each 64-point resampled window.
 /  attrs: tool, schema_version, seriesxrd_version, created_at, sample_type,
           source_requested, source_resolved, source_analysis, unit,
           n_frames, n_peaks, n_windows, all_peak_policy,
-          roi_area_method, roi_area_directional
+          roi_area_method, roi_area_directional, order_by, order_label
 /provenance                         standard input identity + effective config
 /transform attrs: method="log_squared", scale, scale_quantile, noise_floor,
           epsilon, epsilon_floor, formula, signed_formula,
@@ -206,6 +206,8 @@ positive-lag fingerprint length from each 64-point resampled window.
 /frames/index                      (M,)    original Analysis frame indices
 /frames/filename                   (M,)    UTF-8
 /frames/pressure                   (M,)    GPa, NaN where unavailable
+/frames/order_value                (M,)    the order_by axis value per frame
+                                           (frame index when order_by="frame")
 
 /peaks/id                          (K,)    stage-local anchor id
 /peaks/source_index                (K,)    row in /peaks or /spots/obs
@@ -214,6 +216,11 @@ positive-lag fingerprint length from each 64-point resampled window.
 /peaks/local_peak                  (K,)    deterministic slot within frame
 /peaks/center, width, half_width   (K,)    native radial unit
 /peaks/area, pressure, track       (K,)    upstream values/provenance
+/peaks/valid                       (K,)    bool; ROI support inside the radial
+                                           axis with no masked bin inside it.
+                                           Invalid anchors have structurally
+                                           NaN score rows and no per-anchor
+                                           plots
 
 /anchor_maps/profile_coordinate    (65,)   normalized review-sampling coordinate
 /anchor_maps/roi_profiles_log_squared (K, 65) review samples only
@@ -230,7 +237,32 @@ positive-lag fingerprint length from each 64-point resampled window.
 /windows/across_direct             (W, M, M) standardized transformed vectors
 /windows/across_acf                (W, M, M) standardized positive-lag FFT-ACF
 /windows/within_acf                (M, W, W) standardized positive-lag FFT-ACF
+
+/tracks  attrs: linker="seriesxrd.analysis.unknowns.link_tracks",
+          similarity="mutual_sqrt_directional_roi", exploratory=True,
+          transition_rule, n_tracks, group_by, link_tol_fwhm, max_gap,
+          min_track_frames, min_roi_similarity, order_by
+/tracks/obs/track, peak_id         (Nobs,) linked observations; peak_id is
+                                           /peaks/id
+/tracks/summary/id, n_obs, first_frame_row, last_frame_row, center_first,
+          center_last, axis_first, axis_last, group, mean_similarity   (T,)
+/tracks/edges/track, peak_from, peak_to, similarity, center_shift,
+          axis_gap                 (E,)    consecutive linked pairs; similarity
+                                           is the mutual sqrt(S(A->B)*S(B->A))
+/tracks/intervals/order_pos, frame_row_from, frame_row_to, axis_from,
+          axis_to, group, births, deaths, n_active, median_center_shift,
+          window_direct_median, transition_candidate   (per-group M_g-1 rows)
+/tracks/group_label                (G,)    UTF-8 scan/folder labels
 ```
+
+`--order-by` (default `frame`) stably orders the retained frames by a
+`/frames` metadata axis before anything downstream sees them; frames missing
+the metadata sort last and are excluded from track linking. `/tracks` is
+present unless the run used `--no-tracks`; it is exploratory throughout — a
+track is a linking hypothesis and a flagged interval is a coincidence of
+changes worth inspecting (the exact rule is recorded in `transition_rule`),
+never a confirmed transition. Older artifacts without `/peaks/valid`,
+`/frames/order_value`, or `/tracks` remain fully readable.
 
 For powder, `half_width = 0.75 × width` and `/anchor_maps/roi_area`
 is a directional integrated IoU on the anchor's absolute native-radial
