@@ -19,7 +19,7 @@ def _run(args: argparse.Namespace) -> int:
             window_step=args.window_step,
             location_tolerance=args.location_tol,
             scale_quantile=args.scale_quantile,
-            make_plots=not args.no_plots,
+            plots=("none",) if args.no_plots else args.plots,
             max_anchor_plots=args.max_anchor_plots,
             order_by=args.order_by,
             make_tracks=not args.no_tracks,
@@ -41,6 +41,13 @@ def _run(args: argparse.Namespace) -> int:
         f"{manifest['n_windows']} window(s) -> {manifest['correlations_h5']}",
         flush=True,
     )
+    if not manifest.get("plots"):
+        # The flip to no-bulk-render is silent otherwise; say so once.
+        print(
+            "[CORRELATIONS] no PNGs written (default). Browse figures in the "
+            "Correlations GUI, or re-run with --plots all for files.",
+            flush=True,
+        )
     return 0
 
 
@@ -112,9 +119,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="One pooled positive-intensity scale shared by all frames.",
     )
     parser.add_argument(
+        "--plots",
+        action="append",
+        choices=(
+            "all", "none", "roi_area", "location", "waterfall",
+            "window_across", "window_within", "tracks",
+        ),
+        default=None,
+        metavar="FAMILY",
+        help=(
+            "Figure families to write as PNG; repeatable. Default: none — "
+            "the HDF5 holds every number and the GUI draws figures on "
+            "demand. Use --plots all for the full set."
+        ),
+    )
+    parser.add_argument(
         "--no-plots",
         action="store_true",
-        help="Write the sample-specific HDF5 and manifest only.",
+        help="Deprecated: rendering is already off unless --plots is given.",
     )
     parser.add_argument(
         "--order-by",

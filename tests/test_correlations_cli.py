@@ -98,6 +98,8 @@ def test_cli_streams_progress_protocol(tmp_path, capsys):
             "2",
             "--location-tolerance",
             "0.2",
+            "--plots",
+            "all",
             "--max-anchor-plots",
             "1",
         ]
@@ -121,6 +123,55 @@ def test_cli_streams_progress_protocol(tmp_path, capsys):
     assert len(
         [f for f in manifest["plot_files"] if "anchor_" in f]
     ) == 3
+
+
+def test_bulk_rendering_is_off_by_default_and_selectable(tmp_path, capsys):
+    """A plain run writes no PNGs and says so; families are selectable."""
+    from seriesxrd.correlations.processing import resolve_plot_families
+    from seriesxrd.correlations.plots import FAMILIES
+
+    analysis = _write_minimal_analysis(tmp_path / "analysis.h5")
+    rc = main(
+        [
+            str(analysis), "--out", str(tmp_path / "plain"),
+            "--sample-type", "powder", "--window-width", "3",
+            "--window-step", "3",
+        ]
+    )
+    assert rc == 0
+    manifest = json.loads(
+        (tmp_path / "plain" / "manifest_powder.json").read_text()
+    )
+    assert manifest["plots"] == [] and manifest["plots_written"] == 0
+    assert not (tmp_path / "plain" / "heatmaps").exists()
+    assert "no PNGs written (default)" in capsys.readouterr().out
+
+    # One family only.
+    rc = main(
+        [
+            str(analysis), "--out", str(tmp_path / "some"),
+            "--sample-type", "powder", "--window-width", "3",
+            "--window-step", "3", "--plots", "waterfall",
+        ]
+    )
+    assert rc == 0
+    manifest = json.loads(
+        (tmp_path / "some" / "manifest_powder.json").read_text()
+    )
+    assert manifest["plots"] == ["waterfall"]
+    assert manifest["plots_written"] > 0
+    assert all("waterfall/" in f for f in manifest["plot_files"])
+
+    # Resolution rules, including the deprecated boolean spelling.
+    assert resolve_plot_families(None, None) == ()
+    assert resolve_plot_families(None, False) == ()
+    assert resolve_plot_families(None, True) == tuple(FAMILIES)
+    assert resolve_plot_families(("all",)) == tuple(FAMILIES)
+    assert resolve_plot_families(("none", "tracks")) == ()
+    # De-duplicated into canonical render order.
+    assert resolve_plot_families(("tracks", "roi_area", "tracks")) == (
+        "roi_area", "tracks",
+    )
 
 
 def test_cli_missing_input_returns_one(tmp_path):
@@ -158,6 +209,8 @@ def test_module_cli_renders_with_no_display(tmp_path):
             "3",
             "--window-step",
             "3",
+            "--plots",
+            "all",
         ],
         cwd=str(Path(__file__).resolve().parents[1]),
         env=env,

@@ -502,7 +502,7 @@ def test_edge_anchor_flagged_and_unplotted(tmp_path):
     analysis = _write_analysis(tmp_path / "analysis.h5", edge_peak=True)
     out = tmp_path / "res"
     manifest = run_correlations(
-        analysis, out, sample_type="powder", make_plots=False
+        analysis, out, sample_type="powder"
     )
     assert manifest["n_peaks"] == 9
     assert manifest["n_anchors_valid"] == 8
@@ -542,7 +542,7 @@ def test_excluded_frames_remap_peak_rows(tmp_path):
     analysis = _write_analysis(tmp_path / "analysis.h5", excluded_idx=(1,))
     out = tmp_path / "res"
     manifest = run_correlations(
-        analysis, out, sample_type="powder", make_plots=False
+        analysis, out, sample_type="powder"
     )
     assert manifest["n_frames"] == 3
     assert manifest["n_excluded_frames"] == 1

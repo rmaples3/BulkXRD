@@ -90,6 +90,38 @@ class PeakTable:
         return int(self.center.size)
 
 
+def resolve_plot_families(
+    plots: "Optional[Sequence[str]]" = None,
+    make_plots: Optional[bool] = None,
+) -> Tuple[str, ...]:
+    """Which figure families a run should write to PNG.
+
+    Bulk rendering is **off by default**: every number is already in the
+    artifact and the GUI draws figures on demand, so a routine run has no
+    reason to emit thousands of files. Ask for them explicitly with
+    ``plots=("all",)`` or a list of families. ``make_plots`` is the
+    deprecated boolean spelling and is honored when ``plots`` is not given.
+    """
+
+    from .plots import FAMILIES
+
+    if plots is None:
+        return tuple(FAMILIES) if make_plots else ()
+    names = tuple(str(name).strip().lower() for name in plots if str(name).strip())
+    if not names or "none" in names:
+        return ()
+    if "all" in names:
+        return tuple(FAMILIES)
+    unknown = [name for name in names if name not in FAMILIES]
+    if unknown:
+        raise ValueError(
+            f"unknown figure families {unknown}; choose from "
+            f"{['all', 'none', *FAMILIES]}"
+        )
+    # De-duplicate while keeping the canonical render order.
+    return tuple(name for name in FAMILIES if name in names)
+
+
 def _progress(done: int, total: int) -> None:
     """House 3-token progress protocol; GUIs parse ``[CORRELATIONS] d t``."""
     print(f"[CORRELATIONS] {int(done)} {int(total)}", flush=True)
@@ -1247,7 +1279,8 @@ def run_correlations(
     window_step: float = DEFAULT_WINDOW_STEP,
     location_tolerance: float = DEFAULT_LOCATION_TOLERANCE,
     scale_quantile: float = DEFAULT_SCALE_QUANTILE,
-    make_plots: bool = True,
+    plots: "Optional[Sequence[str]]" = None,
+    make_plots: Optional[bool] = None,
     max_anchor_plots: Optional[int] = None,
     order_by: str = "frame",
     make_tracks: bool = True,
@@ -1259,17 +1292,22 @@ def run_correlations(
     export_csv: bool = False,
     export_matrix_csv: bool = False,
 ) -> Dict[str, Any]:
-    """Generate the complete MVP correlation artifact and optional figures.
+    """Generate the correlation artifact, and optionally figures and CSVs.
 
     ``order_by`` orders the retained frames by a /frames metadata axis
     (``frame`` | ``pressure`` | ``temperature`` | ``time``) before anything
     downstream sees them, so waterfall rows, window frame axes, and peak
     ``frame_row`` all follow the physical series. The default keeps the
     Analysis file order exactly as before.
+
+    ``plots`` selects which figure families to write as PNG; the default is
+    **none**, because the artifact already holds every number and figures
+    are drawn on demand. See :func:`resolve_plot_families`.
     """
 
     import h5py  # type: ignore
 
+    plot_families = resolve_plot_families(plots, make_plots)
     analysis_path = Path(analysis_h5).expanduser().resolve()
     if not analysis_path.is_file():
         raise FileNotFoundError(f"Analysis HDF5 not found: {analysis_path}")
@@ -1407,7 +1445,7 @@ def run_correlations(
         "window_step": float(window_step),
         "location_tolerance": float(location_tolerance),
         "scale_quantile": float(scale_quantile),
-        "make_plots": bool(make_plots),
+        "plots": list(plot_families),
         "max_anchor_plots": (
             None if max_anchor_plots is None else int(max_anchor_plots)
         ),
@@ -1449,13 +1487,14 @@ def run_correlations(
     )
 
     plot_files: Sequence[str] = ()
-    if make_plots:
+    if plot_families:
         from .plots import render_all
 
         plot_files = render_all(
             h5_path,
             destination / "heatmaps",
             max_anchor_plots=max_anchor_plots,
+            families=plot_families,
         )
     csv_files: list = []
     if export_csv or export_matrix_csv:
@@ -1508,8 +1547,8 @@ def run_correlations(
             "window_across_acf",
             "window_within_acf",
         ]
-        + (["tracks"] if tracks_bundle is not None else [])
-        + (["waterfall"] if make_plots else []),
+        + (["tracks"] if tracks_bundle is not None else []),
+        "plots": list(plot_families),
         "anchor_plot_cap": (
             None if max_anchor_plots is None else int(max_anchor_plots)
         ),

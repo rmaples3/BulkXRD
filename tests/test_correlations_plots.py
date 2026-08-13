@@ -171,7 +171,7 @@ def test_catalogue_matches_what_export_writes(tmp_path):
 
     analysis = _write_analysis(tmp_path / "analysis.h5")
     manifest = run_correlations(
-        analysis, tmp_path / "res", sample_type="powder", make_plots=False,
+        analysis, tmp_path / "res", sample_type="powder",
     )
     artifact = Path(manifest["correlations_h5"])
     ctx = FigureContext(artifact)
@@ -208,7 +208,7 @@ def test_live_build_matches_exported_png(tmp_path):
     analysis = _write_analysis(tmp_path / "analysis.h5")
     manifest = run_correlations(
         analysis, tmp_path / "res", sample_type="powder",
-        make_plots=True, max_anchor_plots=1,
+        plots=("all",), max_anchor_plots=1,
     )
     artifact = Path(manifest["correlations_h5"])
     ctx = FigureContext(artifact)
@@ -247,6 +247,7 @@ def test_anchor_plot_cap_and_validity_skip(tmp_path):
         analysis,
         tmp_path / "res",
         sample_type="powder",
+        plots=("all",),
         max_anchor_plots=2,
     )
     assert manifest["anchor_plot_cap"] == 2

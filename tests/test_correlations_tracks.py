@@ -34,7 +34,8 @@ def test_end_to_end_tracks_two_drifting_peaks(tmp_path):
     analysis = _write_analysis(tmp_path / "analysis.h5")
     out = tmp_path / "res"
     manifest = run_correlations(
-        analysis, out, sample_type="powder", max_anchor_plots=1,
+        analysis, out, sample_type="powder", plots=("all",),
+        max_anchor_plots=1,
     )
     assert manifest["tracks"]["n_tracks"] == 2
     assert manifest["tracks"]["n_track_obs"] == 8
