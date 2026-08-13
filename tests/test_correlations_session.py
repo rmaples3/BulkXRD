@@ -375,10 +375,14 @@ def test_missing_selected_png_clears_the_previous_preview(tmp_path):
     controller = CorrelationApp.__new__(CorrelationApp)
     controller._preview_after_id = "scheduled"
     controller.results_tree = _Tree()
-    controller._result_paths = {"leaf": missing}
+    controller._result_paths = {
+        "leaf": {"source": "file", "path": missing, "spec": None}
+    }
     controller._preview_photo = object()
     controller.preview_label = _Widget()
     controller.preview_path_label = _Widget()
+    controller._live_canvas = None
+    controller._live_figure = None
 
     controller._preview_selected()
 
@@ -386,6 +390,94 @@ def test_missing_selected_png_clears_the_previous_preview(tmp_path):
     assert controller._preview_photo is None
     assert "no longer exists" in controller.preview_label.options["text"]
     assert controller.preview_path_label.options["text"] == str(missing)
+
+
+def test_live_selection_renders_off_thread_and_drops_stale_figures(tmp_path):
+    """A live entry builds its figure on a worker thread; only the newest
+    request is embedded, and superseded figures are released."""
+    import queue as queue_module
+
+    from seriesxrd.correlations.plots import FigureSpec
+
+    class _Widget:
+        def __init__(self):
+            self.options = {}
+
+        def configure(self, **kwargs):
+            self.options.update(kwargs)
+
+        def winfo_ismapped(self):
+            return True
+
+        def pack(self, **_kwargs):
+            pass
+
+        def pack_forget(self):
+            pass
+
+    class _Figure:
+        def __init__(self):
+            self.cleared = False
+
+        def clear(self):
+            self.cleared = True
+
+    controller = CorrelationApp.__new__(CorrelationApp)
+    controller._render_generation = 4
+    controller._live_canvas = None
+    controller._live_figure = None
+    controller.preview_label = _Widget()
+    controller.preview_path_label = _Widget()
+    controller._event_queue = queue_module.Queue()
+    embedded = []
+    controller._preview_host = object()
+    controller.root = object()
+    controller._add_nav_toolbar = lambda canvas, parent: None
+
+    # A figure from a superseded generation is dropped AND released.
+    stale = _Figure()
+    controller._handle_figure_event(("figure", 3, stale))
+    assert stale.cleared and controller._live_figure is None
+
+    # The current generation is embedded.
+    import seriesxrd.correlations.gui as gui_module
+
+    fresh = _Figure()
+    original = gui_module.embed_figure
+    gui_module.embed_figure = lambda *a, **k: embedded.append(a) or "canvas"
+    try:
+        controller._handle_figure_event(("figure", 4, fresh))
+    finally:
+        gui_module.embed_figure = original
+    assert controller._live_figure is fresh and not fresh.cleared
+    assert controller._live_canvas == "canvas" and embedded
+
+    # A render failure reports rather than raising.
+    controller._live_canvas = None
+    controller._handle_figure_event(("figure_error", 4, "boom"))
+    assert "boom" in controller.preview_label.options["text"]
+
+
+def test_live_entries_come_from_the_artifact_catalogue(tmp_path):
+    """The browsable list is built from the artifact, so it needs no PNGs."""
+    from seriesxrd.correlations.gui import _live_entries
+    from seriesxrd.correlations.processing import run_correlations
+    from tests.test_correlations_processing import _write_analysis
+
+    analysis = _write_analysis(tmp_path / "analysis.h5")
+    manifest = run_correlations(
+        analysis, tmp_path / "res", sample_type="powder",
+    )
+    assert manifest["plots_written"] == 0        # no files at all
+    entries = _live_entries(Path(manifest["correlations_h5"]))
+    assert entries
+    assert all(entry["source"] == "live" for entry in entries)
+    assert all(entry["path"] is None for entry in entries)
+    kinds = {entry["category"] for entry in entries}
+    assert {"roi_area", "location", "waterfall", "window_across"} <= kinds
+    # Pressure labels come from the artifact, not from folder-name decoding.
+    anchors = [e for e in entries if e["category"] == "roi_area"]
+    assert any("GPa" in e["pressure_label"] for e in anchors)
 
 
 def test_result_pressure_folder_display_and_sort_value():

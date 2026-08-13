@@ -31,6 +31,7 @@ from ..core.processes import (
     worker_popen,
 )
 from ..guikit import theme
+from ..guikit.mpl_embed import embed_figure
 from ..guikit.tkstyle import apply_theme
 from ..guikit.tooltip import ToolTip as _ToolTip
 
@@ -108,6 +109,81 @@ def _load_result_pressures(result_root: Path) -> "dict[tuple[str, int], float]":
         except (OSError, ValueError):
             continue
     return pressure_by_frame
+
+
+def _entry_key(entry: "Mapping[str, Any] | None") -> "tuple | None":
+    """Stable identity for a browsable entry across tree rebuilds."""
+    if not entry:
+        return None
+    if entry.get("source") == "live":
+        spec = entry["spec"]
+        return ("live", str(entry["artifact"]), spec.kind, spec.index, spec.variant)
+    return ("file", str(entry.get("path", "")))
+
+
+def _live_entries(artifact: Path) -> "list[Dict[str, Any]]":
+    """Browsable entries for every figure an artifact can draw.
+
+    Built from the artifact's own catalogue rather than from files on disk,
+    so the full list appears instantly and only the selected figure is ever
+    rendered. Pressures come straight from the artifact instead of being
+    decoded back out of ``pressure_3p5_GPa`` folder names.
+    """
+
+    from .plots import FigureContext, figure_index
+
+    ctx = FigureContext(artifact)
+    sample_label = {
+        "powder": "Powder",
+        "single_crystal": "Single crystal",
+    }.get(ctx.sample_type, ctx.sample_type.replace("_", " ").title())
+    entries: "list[Dict[str, Any]]" = []
+    for spec in figure_index(ctx):
+        category_label = RESULT_CATEGORY_LABELS.get(
+            spec.kind, spec.kind.replace("_", " ").title()
+        )
+        method_label = spec.variant.upper() if spec.variant else ""
+        searchable = " ".join(
+            (
+                sample_label, ctx.sample_type, category_label, spec.kind,
+                spec.pressure_label, method_label, spec.label, spec.relpath,
+            )
+        ).casefold()
+        entries.append(
+            {
+                "source": "live",
+                "spec": spec,
+                "artifact": artifact,
+                "path": None,
+                "sample_type": ctx.sample_type,
+                "sample_label": sample_label,
+                "category": spec.kind,
+                "category_label": category_label,
+                "pressure_label": spec.pressure_label,
+                "pressure_value": (
+                    float(spec.pressure)
+                    if math.isfinite(spec.pressure)
+                    else float("-inf") if spec.kind in
+                    ("window_across", "tracks") else float("inf")
+                ),
+                "method_label": method_label,
+                "leaf_label": spec.label,
+                "searchable": searchable,
+                "sort_key": (
+                    0 if ctx.sample_type == "powder" else 1,
+                    RESULT_CATEGORY_ORDER.get(
+                        spec.kind, len(RESULT_CATEGORY_ORDER)
+                    ),
+                    float(spec.pressure)
+                    if math.isfinite(spec.pressure)
+                    else float("inf"),
+                    method_label,
+                    spec.label.casefold(),
+                    spec.relpath.casefold(),
+                ),
+            }
+        )
+    return entries
 
 
 def _classify_result_path(
@@ -192,6 +268,9 @@ def _classify_result_path(
         )
     ).casefold()
     return {
+        "source": "file",
+        "spec": None,
+        "artifact": None,
         "path": path,
         "relative": relative,
         "sample_type": sample_type,
@@ -339,6 +418,14 @@ class CorrelationApp:
         self._last_filter_signature = None
         # (widget, idle state) pairs locked while a run is live.
         self._setting_widgets: "list[tuple[Any, str]]" = []
+        # Live figure rendering: cached artifact context (built on the render
+        # thread, so guarded), the embedded canvas, and a generation counter
+        # that discards figures superseded by a newer selection.
+        self._figure_ctx = None
+        self._context_lock = threading.Lock()
+        self._live_canvas = None
+        self._live_figure = None
+        self._render_generation = 0
 
         self._build_gui()
         theme.register_widget_tree(self._embed_parent or self.root)
@@ -749,16 +836,21 @@ class CorrelationApp:
             "write", lambda *_args: self._schedule_result_filter(),
         )
 
-        self.preview_label = ttk.Label(
-            preview_frame, text="Select a heatmap to preview it.",
-            style="Muted.TLabel", anchor="center", justify="center",
-        )
-        self.preview_label.pack(fill="both", expand=True, padx=8, pady=8)
         self.preview_path_label = ttk.Label(
             preview_frame, text="", style="Muted.TLabel", anchor="w",
         )
-        self.preview_path_label.pack(fill="x", padx=8, pady=(0, 6))
-        preview_frame.bind("<Configure>", lambda _event: self._schedule_preview())
+        self.preview_path_label.pack(side="bottom", fill="x", padx=8, pady=(0, 6))
+        self._preview_host = ttk.Frame(preview_frame)
+        self._preview_host.pack(fill="both", expand=True, padx=8, pady=8)
+        self.preview_label = ttk.Label(
+            self._preview_host, text="Select a diagram to render it.",
+            style="Muted.TLabel", anchor="center", justify="center",
+        )
+        self.preview_label.pack(fill="both", expand=True)
+        # Only a bitmap preview needs re-fitting on resize; an embedded
+        # canvas re-flows itself, and rebuilding its figure on every
+        # <Configure> would be pure waste.
+        preview_frame.bind("<Configure>", lambda _event: self._on_preview_resize())
         self._preview_frame = preview_frame
 
     # ------------------------------------------------------------------
@@ -1138,6 +1230,8 @@ class CorrelationApp:
                 try:
                     if event[0] == "progress":
                         self._update_progress(int(event[1]), int(event[2]))
+                    elif event[0] in ("figure", "figure_error"):
+                        self._handle_figure_event(event)
                     elif event[0] in ("csv_done", "csv_error"):
                         self._handle_csv_event(event)
                     else:
@@ -1374,12 +1468,11 @@ class CorrelationApp:
 
         self._result_entries = []
         self._review_result_root = None
+        self._last_filter_signature = None
         self._apply_result_filters()
         self.results_status.configure(text=status)
         self._preview_photo = None
-        self.preview_label.configure(
-            image="", text=preview, style="Muted.TLabel",
-        )
+        self._show_preview_message(preview)
         self.preview_path_label.configure(text="")
 
     def _apply_result_filters(self) -> None:
@@ -1413,10 +1506,11 @@ class CorrelationApp:
             return
         self._last_filter_signature = signature
 
-        selected_path = None
+        selected_key = None
         selected = tree.selection()
         if selected:
-            selected_path = self._result_paths.get(selected[0])
+            previous = self._result_paths.get(selected[0])
+            selected_key = _entry_key(previous) if previous else None
         for item in tree.get_children(""):
             tree.delete(item)
         self._result_paths.clear()
@@ -1471,10 +1565,10 @@ class CorrelationApp:
                     opened=expand_matches,
                 )
             leaf = tree.insert(parent, "end", text=str(entry["leaf_label"]))
-            self._result_paths[leaf] = Path(entry["path"])
+            self._result_paths[leaf] = entry
             if first_leaf is None:
                 first_leaf = leaf
-            if selected_path == Path(entry["path"]):
+            if selected_key is not None and _entry_key(entry) == selected_key:
                 selected_leaf = leaf
 
         total = len(self._result_entries)
@@ -1497,13 +1591,10 @@ class CorrelationApp:
             tree.see(chosen_leaf)
             self._schedule_preview()
         else:
-            self.preview_label.configure(
-                image="",
-                text=(
-                    "No diagrams match the current search and diagram filter."
-                    if total else "No correlation diagram PNGs were found in this result folder."
-                ),
-                style="Muted.TLabel",
+            self._show_preview_message(
+                "No diagrams match the current search and diagram filter."
+                if total
+                else "No correlation diagrams found — run correlations first."
             )
 
     def review_results(
@@ -1538,34 +1629,181 @@ class CorrelationApp:
                 )
             return
 
-        try:
-            paths = _find_result_paths(result_root)
-        except OSError as exc:
-            self._clear_result_browser(
-                "Could not read result folder.",
-                "The selected result folder could not be read.",
-            )
-            if show_errors:
-                self.messagebox.showerror("Could not read results", str(exc))
-            return
+        entries: "list[Dict[str, Any]]" = []
+        problems: "list[str]" = []
+        for sample_type in SAMPLE_TYPES:
+            artifact = result_root / f"correlations_{sample_type}.h5"
+            if artifact.is_file():
+                # The artifact IS the catalogue: list every figure it can
+                # draw, and render only what the user selects. Published
+                # PNGs are exactly this list, so indexing both would only
+                # duplicate the tree.
+                try:
+                    entries.extend(_live_entries(artifact))
+                    continue
+                except Exception as exc:
+                    problems.append(f"{artifact.name}: {exc}")
+            sample_root = result_root / "heatmaps" / sample_type
+            if sample_root.is_dir():
+                try:
+                    pressures = _load_result_pressures(result_root)
+                    entries.extend(
+                        _classify_result_path(path, result_root, pressures)
+                        for path in sorted(sample_root.rglob("*.png"))
+                        if path.is_file()
+                    )
+                except OSError as exc:
+                    problems.append(str(exc))
 
         self._review_result_root = result_root.resolve()
-        pressure_by_frame = _load_result_pressures(result_root)
         self._result_entries = sorted(
-            (
-                _classify_result_path(path, result_root, pressure_by_frame)
-                for path in paths
-            ),
-            key=lambda entry: entry["sort_key"],
+            entries, key=lambda entry: entry["sort_key"]
         )
-        self.preview_label.configure(
-            image="", text="Select a heatmap to preview it.",
-            style="Muted.TLabel",
-        )
+        self._clear_live_figure()
+        self._show_preview_message("Select a diagram to render it.")
         self.preview_path_label.configure(text="")
         self._preview_photo = None
+        self._last_filter_signature = None
         self._apply_result_filters()
+        if problems and show_errors:
+            self.messagebox.showwarning(
+                "Correlation results", "\n".join(problems[:4]),
+            )
         self.select_page("results")
+
+    # ------------------------------------------------------------------
+    # Live figure rendering
+    # ------------------------------------------------------------------
+
+    def _figure_context(self, artifact: Path):
+        """Cached FigureContext for one artifact, rebuilt when it changes.
+
+        Called from the render thread, so construction is serialized: the
+        context itself never holds an open HDF5 handle, and each row slice
+        opens its own, which keeps this safe without a global h5py lock.
+        """
+        from .plots import FigureContext
+
+        key = (str(artifact), artifact.stat().st_mtime_ns)
+        with self._context_lock:
+            cached = self._figure_ctx
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            ctx = FigureContext(artifact)
+            self._figure_ctx = (key, ctx)
+            return ctx
+
+    def _clear_live_figure(self):
+        canvas = self._live_canvas
+        self._live_canvas = None
+        if canvas is not None:
+            try:
+                canvas.get_tk_widget().destroy()
+            except Exception:
+                pass
+        figure = self._live_figure
+        self._live_figure = None
+        if figure is not None:
+            try:
+                figure.clear()
+            except Exception:
+                pass
+
+    def _show_preview_message(self, text: str, style: str = "Muted.TLabel"):
+        self._clear_live_figure()
+        try:
+            if not self.preview_label.winfo_ismapped():
+                self.preview_label.pack(fill="both", expand=True)
+            self.preview_label.configure(image="", text=text, style=style)
+        except Exception:
+            pass
+
+    def _request_live_figure(self, entry: Mapping[str, Any]):
+        """Build the selected figure off-thread, then embed it on the main
+        thread. Only the newest request is embedded, so clicking quickly
+        through a tree cannot paint a stale figure."""
+        spec = entry["spec"]
+        artifact = Path(entry["artifact"])
+        self._render_generation += 1
+        generation = self._render_generation
+        self._show_preview_message(f"Rendering {spec.label}…")
+        self.preview_path_label.configure(text=spec.relpath)
+
+        def _work():
+            try:
+                from .plots import build_figure
+
+                ctx = self._figure_context(artifact)
+                figure = build_figure(ctx, spec)
+            except Exception as exc:
+                self._event_queue.put(("figure_error", generation, repr(exc)))
+            else:
+                self._event_queue.put(("figure", generation, figure))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _handle_figure_event(self, event: tuple):
+        kind, generation = event[0], int(event[1])
+        if generation != self._render_generation:
+            # Superseded by a newer selection: drop it, and release the
+            # figure we are not going to show.
+            if kind == "figure":
+                try:
+                    event[2].clear()
+                except Exception:
+                    pass
+            return
+        if kind == "figure_error":
+            self._show_preview_message(
+                f"Could not render this diagram:\n{event[2]}", "Warn.TLabel",
+            )
+            return
+        figure = event[2]
+        self._clear_live_figure()
+        try:
+            self.preview_label.pack_forget()
+            self._live_figure = figure
+            self._live_canvas = embed_figure(
+                self._preview_host, figure, self.root,
+                toolbar_factory=self._add_nav_toolbar,
+            )
+        except Exception as exc:
+            self._show_preview_message(
+                f"Could not display this diagram:\n{exc!r}", "Warn.TLabel",
+            )
+
+    def _add_nav_toolbar(self, canvas, parent):
+        """Pan/zoom/save toolbar under the canvas; silent if unavailable."""
+        try:
+            from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+
+            toolbar = NavigationToolbar2Tk(canvas, parent, pack_toolbar=False)
+            toolbar.update()
+            try:
+                toolbar.configure(background=theme.C.BG)
+                for child in toolbar.winfo_children():
+                    if child.winfo_class() in (
+                        "Button", "Checkbutton", "Radiobutton",
+                    ):
+                        child.configure(
+                            background=theme.C.FG,
+                            activebackground=theme.C.ACCENT,
+                            highlightbackground=theme.C.BG,
+                            relief="flat",
+                        )
+                    else:
+                        child.configure(background=theme.C.BG)
+            except Exception:
+                pass
+            toolbar.pack(side="bottom", fill="x")
+            return toolbar
+        except Exception:
+            return None
+
+    def _on_preview_resize(self):
+        """Only a bitmap preview needs refitting; a canvas re-flows itself."""
+        if self._live_canvas is None:
+            self._schedule_preview()
 
     def _schedule_preview(self):
         if self._closing or not hasattr(self, "results_tree"):
@@ -1582,15 +1820,19 @@ class CorrelationApp:
         selected = self.results_tree.selection()
         if not selected:
             return
-        path = self._result_paths.get(selected[0])
-        if path is None:
+        entry = self._result_paths.get(selected[0])
+        if entry is None:
             self._preview_photo = None
-            self.preview_label.configure(
-                image="", text="Expand the group and select a correlation plot.",
-                style="Muted.TLabel",
+            self._show_preview_message(
+                "Expand the group and select a correlation diagram."
             )
             self.preview_path_label.configure(text="")
             return
+        if entry.get("source") == "live":
+            self._preview_photo = None
+            self._request_live_figure(entry)
+            return
+        path = Path(entry["path"])
         if not path.is_file():
             self._preview_photo = None
             self.preview_label.configure(
@@ -1635,6 +1877,9 @@ class CorrelationApp:
             self._preview_photo = None
             return
         self._preview_photo = photo
+        self._clear_live_figure()
+        if not self.preview_label.winfo_ismapped():
+            self.preview_label.pack(fill="both", expand=True)
         self.preview_label.configure(image=photo, text="")
         try:
             relative = path.relative_to(self._review_result_root or path.parent)
@@ -1728,6 +1973,8 @@ class CorrelationApp:
         self._poll_after_id = None
         self._preview_after_id = None
         self._result_filter_after_id = None
+        self._clear_live_figure()
+        self._figure_ctx = None
         self.save_config(silent=True)
         return True
 
