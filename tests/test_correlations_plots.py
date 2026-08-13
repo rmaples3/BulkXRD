@@ -82,34 +82,45 @@ def test_window_render_paths_use_triangle_mask_and_leave_h5_full(
     artifact = tmp_path / "correlations_powder.h5"
     stored = _write_plot_artifact(artifact)
     helper_inputs = []
-    rendered = []
+    shown_matrices = []
+    saved_paths = []
     real_mask = plots._strict_lower_triangle
+
+    class _StubFigure:
+        def savefig(self, *_args, **_kwargs):
+            pass
+
+        def clear(self):
+            pass
 
     def spy_mask(matrix):
         helper_inputs.append(np.asarray(matrix, dtype=float).copy())
         return real_mask(matrix)
 
-    def capture_heatmap(matrix, path, **_kwargs):
-        rendered.append((Path(path), np.asarray(matrix, dtype=float).copy()))
+    def capture_heatmap(matrix, **_kwargs):
+        shown_matrices.append(np.asarray(matrix, dtype=float).copy())
+        return _StubFigure()
 
     monkeypatch.setattr(plots, "_strict_lower_triangle", spy_mask)
     monkeypatch.setattr(plots, "_heatmap", capture_heatmap)
+    monkeypatch.setattr(
+        plots, "save_figure", lambda fig, path: saved_paths.append(Path(path))
+    )
 
     files = plots._render_into(artifact, tmp_path / "rendered")
 
     full_matrices = [matrix for group in stored for matrix in group]
-    assert len(helper_inputs) == len(rendered) == len(files) == 6
+    assert len(helper_inputs) == len(shown_matrices) == len(files) == 6
+    assert len(saved_paths) == 6
     assert all(
         "window_across" in path.parts or "window_within" in path.parts
-        for path, _matrix in rendered
+        for path in saved_paths
     )
-    for source, helper_input, (_path, shown) in zip(
-        full_matrices, helper_inputs, rendered
+    for source, helper_input, shown in zip(
+        full_matrices, helper_inputs, shown_matrices
     ):
         np.testing.assert_array_equal(helper_input, source)
-        np.testing.assert_allclose(
-            shown, real_mask(source), equal_nan=True
-        )
+        np.testing.assert_allclose(shown, real_mask(source), equal_nan=True)
 
     # Rendering is a view concern: the artifact retains both symmetric halves
     # and its unit diagonal for downstream numerical use.
@@ -123,43 +134,90 @@ def test_waterfall_height_capped(tmp_path, monkeypatch):
     """A many-frame series renders a bounded figure, not a 100-inch PNG."""
     heights = []
 
-    def capture_save(fig, path):
-        heights.append(float(fig.get_size_inches()[1]))
-        fig.clear()
-
-    monkeypatch.setattr(plots, "_atomic_save", capture_save)
-    n_frames = 200
     radial = np.linspace(1.0, 3.0, 50)
-    plots._waterfall(
-        tmp_path / "w.png",
-        radial=radial,
-        original_positive=np.ones((n_frames, radial.size)),
-        frame_indices=np.arange(n_frames),
-        frame_pressure=np.full(n_frames, np.nan),
-        peak_frame=np.asarray([0]),
-        centers=np.asarray([2.0]),
-        half_width=np.asarray([0.2]),
-        score=np.asarray([0.5]),
-        anchor=0,
-        unit="q_A^-1",
-    )
-    assert heights and heights[0] <= 18.0
 
+    def _build(n_frames):
+        fig = plots._waterfall(
+            radial=radial,
+            original_positive=np.ones((n_frames, radial.size)),
+            frame_indices=np.arange(n_frames),
+            frame_pressure=np.full(n_frames, np.nan),
+            peak_frame=np.asarray([0]),
+            centers=np.asarray([2.0]),
+            half_width=np.asarray([0.2]),
+            score=np.asarray([0.5]),
+            anchor=0,
+            unit="q_A^-1",
+        )
+        height = float(fig.get_size_inches()[1])
+        fig.clear()
+        return height
+
+    heights.append(_build(200))
+    assert heights[0] <= 18.0
     # A small series keeps its full per-frame layout.
-    plots._waterfall(
-        tmp_path / "w2.png",
-        radial=radial,
-        original_positive=np.ones((6, radial.size)),
-        frame_indices=np.arange(6),
-        frame_pressure=np.full(6, np.nan),
-        peak_frame=np.asarray([0]),
-        centers=np.asarray([2.0]),
-        half_width=np.asarray([0.2]),
-        score=np.asarray([0.5]),
-        anchor=0,
-        unit="q_A^-1",
-    )
+    heights.append(_build(6))
     assert heights[1] == pytest.approx(0.55 * 6 + 2.2)
+
+
+def test_catalogue_matches_what_export_writes(tmp_path):
+    """One source of truth: every catalogued spec is exported, and nothing
+    else is — so a browsed figure and an exported PNG cannot disagree."""
+    from seriesxrd.correlations.plots import (
+        FigureContext, figure_index, render_all,
+    )
+    from seriesxrd.correlations.processing import run_correlations
+    from tests.test_correlations_processing import _write_analysis
+
+    analysis = _write_analysis(tmp_path / "analysis.h5")
+    manifest = run_correlations(
+        analysis, tmp_path / "res", sample_type="powder", make_plots=False,
+    )
+    artifact = Path(manifest["correlations_h5"])
+    ctx = FigureContext(artifact)
+    specs = figure_index(ctx)
+    written = render_all(artifact, tmp_path / "res" / "heatmaps")
+
+    assert {s.relpath for s in specs} == {
+        f.split("heatmaps/powder/", 1)[1] for f in written
+    }
+    # Invalid anchors are absent from both, and the render order is the
+    # catalogue order.
+    assert [s.relpath for s in specs] == [
+        f.split("heatmaps/powder/", 1)[1] for f in written
+    ]
+
+    # Selecting a family exports exactly that family.
+    only_tracks = render_all(
+        artifact, tmp_path / "res" / "heatmaps2", families=("tracks",)
+    )
+    assert only_tracks and all("tracks/" in f for f in only_tracks)
+    assert len(only_tracks) == len(
+        [s for s in specs if s.kind == "tracks"]
+    )
+
+
+def test_live_build_matches_exported_png(tmp_path):
+    """The same spec rendered live and saved to disk is the same picture."""
+    from seriesxrd.correlations.plots import (
+        FigureContext, build_figure, figure_index, save_figure,
+    )
+    from seriesxrd.correlations.processing import run_correlations
+    from tests.test_correlations_processing import _write_analysis
+
+    analysis = _write_analysis(tmp_path / "analysis.h5")
+    manifest = run_correlations(
+        analysis, tmp_path / "res", sample_type="powder",
+        make_plots=True, max_anchor_plots=1,
+    )
+    artifact = Path(manifest["correlations_h5"])
+    ctx = FigureContext(artifact)
+    for spec in figure_index(ctx, max_anchor_plots=1)[:4]:
+        exported = tmp_path / "res" / "heatmaps" / "powder" / spec.relpath
+        assert exported.is_file()
+        live = tmp_path / "live.png"
+        save_figure(build_figure(ctx, spec), live)
+        assert live.read_bytes() == exported.read_bytes(), spec.relpath
 
 
 def test_waterfall_normalization_resists_zingers():
