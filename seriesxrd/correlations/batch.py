@@ -2,6 +2,19 @@
 from __future__ import annotations
 
 import argparse
+from typing import Any
+
+
+def _interrupted() -> type:
+    """The stage's graceful-stop exception (imported lazily)."""
+    from .checkpoint import RunInterrupted
+
+    return RunInterrupted
+
+
+#: Conventional "interrupted" status. The GUI and a shell user both read it
+#: as "stopped on request, resumable", not as a failure.
+EXIT_INTERRUPTED = 130
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -30,7 +43,17 @@ def _run(args: argparse.Namespace) -> int:
             track_group_by=args.track_group_by,
             export_csv=args.export_csv,
             export_matrix_csv=args.export_matrices,
+            resume=args.resume,
         )
+    except (KeyboardInterrupt, _interrupted()):
+        # Figures already rendered are kept in the staging tree; say how to
+        # pick them up rather than leaving the user to guess.
+        print(
+            "\n[CORRELATIONS] stopped on request. Finished figures were kept; "
+            "re-run the same command with --resume to continue.",
+            flush=True,
+        )
+        return EXIT_INTERRUPTED
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"[ERROR] correlation generation failed: {exc}", flush=True)
         return 1
@@ -196,6 +219,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Link tracks only within these frame groups (default: none).",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an interrupted run: reuse the existing artifact when it "
+            "still matches these settings, and skip figures already rendered."
+        ),
+    )
+    parser.add_argument(
         "--export-csv",
         action="store_true",
         help=(
@@ -215,6 +246,40 @@ def main(argv: "list[str] | None" = None) -> int:
     from ..core.config import make_stdio_robust
 
     make_stdio_robust()
+    # A supervisor's terminate() (the GUI's Cancel, a scheduler kill) and
+    # Ctrl-C should both stop at the next figure and keep what is done.
+    #
+    # The handler sets a flag rather than raising: an exception raised from
+    # a handler lands wherever the interpreter happens to be, and inside a
+    # weakref finalizer or __del__ -- which matplotlib generates constantly
+    # while rendering -- CPython prints "Exception ignored in ..." and
+    # discards it, so the run would sail on. Measured, not theorized.
+    import signal
+
+    from . import checkpoint
+
+    checkpoint.clear_stop()
+    previous: "dict[int, Any]" = {}
+
+    def _graceful(signum, frame):
+        if checkpoint.stop_requested():
+            # Second signal: the user means it. Restore the default and
+            # let it through.
+            handler = previous.get(signum, signal.SIG_DFL)
+            signal.signal(signum, handler)
+            signal.raise_signal(signum)
+            return
+        checkpoint.request_stop()
+        print(
+            "[CORRELATIONS] stop requested — finishing the current figure…",
+            flush=True,
+        )
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous[signum] = signal.signal(signum, _graceful)
+        except (ValueError, OSError):   # non-main thread / exotic platform
+            pass
     return _run(build_parser().parse_args(argv))
 
 

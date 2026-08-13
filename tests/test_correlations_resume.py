@@ -175,6 +175,68 @@ def test_promote_publishes_and_records_incompleteness(tmp_path):
     assert "interrupted" in marker["reason"]
 
 
+def test_sigterm_stops_gracefully_and_resume_finishes(tmp_path):
+    """SIGTERM stops at a figure boundary with exit 130, keeps what is done,
+    and --resume completes the export without recomputing."""
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    analysis = _write_analysis(tmp_path / "analysis.h5")
+    out = tmp_path / "res"
+    argv = [
+        sys.executable, "-m", "seriesxrd.correlations.batch", str(analysis),
+        "--out", str(out), "--sample-type", "powder", "--plots", "all",
+    ]
+    env = dict(os.environ, MPLBACKEND="Agg")
+    proc = subprocess.Popen(
+        argv, cwd=str(Path(__file__).resolve().parents[1]), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    # Stop it once figures have started landing.
+    staged = None
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        found = checkpoint.find_staging(out, "powder")
+        if found and list(found[0].rglob("*.png")):
+            staged = found[0]
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    if staged is None:
+        proc.kill()
+        proc.wait(timeout=30)
+        pytest.skip("render finished before it could be interrupted")
+
+    proc.send_signal(signal.SIGTERM)
+    output = proc.communicate(timeout=60)[0]
+    assert proc.returncode == 130, output
+    assert "--resume" in output
+
+    recoverable = checkpoint.find_recoverable(out)
+    assert recoverable and recoverable[0]["status"] == "interrupted"
+    partial = recoverable[0]["n_figures"]
+    assert partial > 0
+    assert not (out / "heatmaps" / "powder").exists()
+
+    artifact_mtime = (out / "correlations_powder.h5").stat().st_mtime_ns
+    finished = subprocess.run(
+        argv + ["--resume"], cwd=str(Path(__file__).resolve().parents[1]),
+        env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert finished.returncode == 0, finished.stdout + finished.stderr
+    assert "exporting only" in finished.stdout
+    # The numbers were not recomputed, and the tree is now complete.
+    assert (
+        out / "correlations_powder.h5"
+    ).stat().st_mtime_ns == artifact_mtime
+    published = list((out / "heatmaps" / "powder").rglob("*.png"))
+    assert len(published) > partial
+    assert not checkpoint.find_recoverable(out)
+
+
 def test_stray_tmp_files_are_swept_on_resume(tmp_path):
     """A SIGKILL between savefig and rename cannot poison a resume."""
     artifact = _artifact(tmp_path)

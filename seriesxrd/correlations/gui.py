@@ -1151,6 +1151,9 @@ class CorrelationApp:
             "--scale-quantile",
             str(scale_quantile),
         ]
+        if _find_recoverable(result_root):
+            # Continue where a stopped run left off rather than redoing it.
+            command.append("--resume")
         if radial_min is not None:
             command.extend(("--radial-min", str(radial_min)))
         if radial_max is not None:
@@ -1392,11 +1395,22 @@ class CorrelationApp:
             return
 
         returncode = int(event[1])
-        if self._cancel_requested:
+        if self._cancel_requested or returncode == 130:
             self._cancel_requested = False
-            self.run_status.configure(text="Run cancelled.", style="Muted.TLabel")
-            self._status_bar.configure(text="correlation worker: cancelled")
-            self.log("Correlation run cancelled by user")
+            resumable = bool(
+                _find_recoverable(Path(active_result_root))
+                if active_result_root else []
+            )
+            hint = " Press Run again to resume." if resumable else ""
+            self.run_status.configure(
+                text=f"Run stopped.{hint}", style="Muted.TLabel",
+            )
+            self._status_bar.configure(text="correlation worker: stopped")
+            self.log("Correlation run stopped by user")
+            if active_result_root is not None:
+                self.review_results(
+                    show_errors=False, result_root=active_result_root
+                )
         elif returncode != 0:
             self.run_status.configure(
                 text=f"Run failed (return code {returncode}). See the log.",
@@ -1441,8 +1455,11 @@ class CorrelationApp:
             return
         self._cancel_requested = True
         self.cancel_button.configure(state="disabled")
-        self.run_status.configure(text="Cancelling…", style="Muted.TLabel")
-        terminate_process_tree(process)
+        self.run_status.configure(text="Stopping…", style="Muted.TLabel")
+        # Longer than the default: the worker stops at the next figure
+        # boundary and keeps what it finished, and a large waterfall can
+        # take a moment. A SIGKILL mid-figure only costs that one figure.
+        terminate_process_tree(process, timeout=5.0)
 
     # ------------------------------------------------------------------
     # Lazy result review

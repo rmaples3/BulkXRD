@@ -740,8 +740,13 @@ def _render_into(
         for stray in base.rglob("*.png.tmp"):
             stray.unlink(missing_ok=True)
 
+    from . import checkpoint as _stop
+
     with ctx.session():
         for spec in specs:
+            # Safe boundary: a stop takes effect between figures, so the
+            # one in flight finishes and the staging tree stays consistent.
+            _stop.check_stop()
             path = base / spec.relpath
             if not (resume and path.is_file()):
                 save_figure(build_figure(ctx, spec), path)

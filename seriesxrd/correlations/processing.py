@@ -16,6 +16,7 @@ the positive Log-squared ROI-area map.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import uuid
@@ -25,7 +26,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..core.config import VERSION, now_iso, write_json
+from ..core.config import VERSION, now_iso, read_json, write_json
 from ..core.provenance import manifest_provenance, write_provenance
 
 SCHEMA_VERSION = "1"
@@ -88,6 +89,129 @@ class PeakTable:
     @property
     def size(self) -> int:
         return int(self.center.size)
+
+
+def reusable_artifact(
+    artifact: Path,
+    analysis_path: Path,
+    compute_config: Mapping[str, Any],
+) -> Tuple[bool, str]:
+    """Whether an existing artifact can stand in for recomputing it.
+
+    No new bookkeeping: ``/provenance`` already records the input hash and
+    the effective config, which is exactly what decides this. Render-only
+    settings are ignored, so asking for different figures never forces the
+    numbers to be recomputed.
+    """
+
+    import h5py  # type: ignore
+
+    from ..core.provenance import file_fingerprint
+
+    if not Path(artifact).is_file():
+        return False, "no existing artifact"
+    try:
+        with h5py.File(str(artifact), "r") as h5:
+            group = h5.get("provenance")
+            if group is None:
+                return False, "artifact has no /provenance"
+            stored = json.loads(str(group.attrs.get("config_json", "{}")))
+            stored_hash = str(group.attrs.get("input_analysis_sha256", ""))
+    except (OSError, ValueError) as exc:
+        return False, f"artifact unreadable ({exc})"
+
+    current_hash = str(file_fingerprint(analysis_path).get("sha256", ""))
+    if not stored_hash or not current_hash:
+        return False, "input hash unavailable"
+    if stored_hash != current_hash:
+        return False, "the Analysis HDF5 changed"
+    for key, value in compute_config.items():
+        if stored.get(key) != value:
+            return False, f"{key} changed ({stored.get(key)!r} -> {value!r})"
+    return True, "reused the existing artifact"
+
+
+def _export_from_existing(
+    artifact: Path,
+    destination: Path,
+    prior: Mapping[str, Any],
+    *,
+    plot_families: Sequence[str],
+    max_anchor_plots: Optional[int],
+    export_csv: bool,
+    export_matrix_csv: bool,
+) -> Dict[str, Any]:
+    """Re-drive export against an artifact that is already up to date.
+
+    The previous run's manifest is carried forward and only its export
+    fields are refreshed, so provenance of the numbers stays attached to
+    the run that produced them.
+    """
+
+    import h5py  # type: ignore
+
+    base: Dict[str, Any] = dict(prior)
+    if not base:
+        # No manifest survived; rebuild the summary from the artifact.
+        with h5py.File(str(artifact), "r") as h5:
+            base = {
+                **manifest_provenance(TOOL, SCHEMA_VERSION),
+                "correlations_h5": str(artifact),
+                "out_dir": str(destination),
+                **{
+                    key: _decode(h5.attrs[key])
+                    if isinstance(h5.attrs[key], (bytes, str))
+                    else h5.attrs[key].item()
+                    for key in (
+                        "sample_type", "unit", "source_requested",
+                        "source_resolved", "order_by", "order_label",
+                        "n_frames", "n_peaks", "n_windows",
+                    )
+                    if key in h5.attrs
+                },
+                "manifest_rebuilt_from_artifact": True,
+            }
+
+    plot_files: Sequence[str] = ()
+    if plot_families:
+        from .plots import render_all
+
+        plot_files = render_all(
+            artifact,
+            destination / "heatmaps",
+            max_anchor_plots=max_anchor_plots,
+            families=plot_families,
+            resume=True,
+        )
+    csv_files: list = []
+    if export_csv or export_matrix_csv:
+        from . import export as _export
+
+        csv_dir = destination / "csv"
+        if export_csv:
+            csv_files.extend(_export.export_summary_csvs(artifact, csv_dir))
+        if export_matrix_csv:
+            csv_files.extend(_export.export_matrices(artifact, csv_dir))
+
+    manifest = base
+    manifest.update(
+        {
+            "resumed": True,
+            "resumed_at": now_iso(),
+            "plots": list(plot_families),
+            "anchor_plot_cap": (
+                None if max_anchor_plots is None else int(max_anchor_plots)
+            ),
+            "plots_written": len(plot_files),
+            "plot_files": list(plot_files),
+            "csv_files": [
+                path.relative_to(destination).as_posix() for path in csv_files
+            ],
+        }
+    )
+    sample = str(manifest.get("sample_type", "powder"))
+    write_json(destination / f"manifest_{sample}.json", manifest)
+    return manifest
 
 
 def resolve_plot_families(
@@ -893,6 +1017,9 @@ def _powder_roi_matrix(
     for done, i in enumerate(anchors_todo, start=1):
         if done % chunk == 0 or done == anchors_todo.size:
             _progress(done, anchors_todo.size)
+            from . import checkpoint as _stop
+
+            _stop.check_stop()
         a_lo, a_hi = float(lo[i]), float(hi[i])
         s0 = int(np.searchsorted(x, a_lo, side="right"))
         s1 = int(np.searchsorted(x, a_hi, side="left"))
@@ -1291,6 +1418,7 @@ def run_correlations(
     track_group_by: str = "none",
     export_csv: bool = False,
     export_matrix_csv: bool = False,
+    resume: bool = False,
 ) -> Dict[str, Any]:
     """Generate the correlation artifact, and optionally figures and CSVs.
 
@@ -1308,6 +1436,7 @@ def run_correlations(
     import h5py  # type: ignore
 
     plot_families = resolve_plot_families(plots, make_plots)
+    resume = bool(resume)
     analysis_path = Path(analysis_h5).expanduser().resolve()
     if not analysis_path.is_file():
         raise FileNotFoundError(f"Analysis HDF5 not found: {analysis_path}")
@@ -1321,6 +1450,49 @@ def run_correlations(
     ) if source is None or not str(source).strip() else str(source).strip().lower()
     if not np.isfinite(location_tolerance) or location_tolerance <= 0.0:
         raise ValueError("location_tolerance must be finite and positive")
+
+    if resume:
+        # Compute is cheap; figure export is not. When the artifact already
+        # matches the requested settings, skip straight to exporting so an
+        # interrupted export resumes instead of recomputing first.
+        existing = destination / f"correlations_{sample}.h5"
+        manifest_path = destination / f"manifest_{sample}.json"
+        compute_key = {
+            "sample_type": sample,
+            "source": source_requested,
+            "radial_min_requested": (
+                None if radial_min is None else float(radial_min)
+            ),
+            "radial_max_requested": (
+                None if radial_max is None else float(radial_max)
+            ),
+            "window_width": float(window_width),
+            "window_step": float(window_step),
+            "location_tolerance": float(location_tolerance),
+            "scale_quantile": float(scale_quantile),
+            "order_by": str(order_by),
+            "make_tracks": bool(make_tracks),
+            "track_min_similarity": float(track_min_similarity),
+            "track_min_frames": int(track_min_frames),
+            "track_link_tol_fwhm": float(track_link_tol_fwhm),
+            "track_max_gap": int(track_max_gap),
+        }
+        ok, reason = reusable_artifact(existing, analysis_path, compute_key)
+        if ok:
+            print(f"[CORRELATIONS] {reason}; exporting only", flush=True)
+            # A run interrupted during export never got to write its
+            # manifest — the very case resume exists for — so fall back to
+            # the artifact's own attributes when it is missing.
+            return _export_from_existing(
+                existing,
+                destination,
+                read_json(manifest_path),
+                plot_families=plot_families,
+                max_anchor_plots=max_anchor_plots,
+                export_csv=export_csv,
+                export_matrix_csv=export_matrix_csv,
+            )
+        print(f"[CORRELATIONS] recomputing ({reason})", flush=True)
 
     from ..analysis.refine_export import _pattern_source
 
@@ -1441,6 +1613,12 @@ def run_correlations(
         "source_resolved": source_resolved,
         "radial_min": float(radial[0]),
         "radial_max": float(radial[-1]),
+        "radial_min_requested": (
+            None if radial_min is None else float(radial_min)
+        ),
+        "radial_max_requested": (
+            None if radial_max is None else float(radial_max)
+        ),
         "window_width": float(window_width),
         "window_step": float(window_step),
         "location_tolerance": float(location_tolerance),

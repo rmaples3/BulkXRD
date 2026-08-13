@@ -16,11 +16,46 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List
 
 from ..core.config import now_iso
+
+
+class RunInterrupted(Exception):
+    """Raised at a safe boundary after a stop was requested."""
+
+
+_STOP = threading.Event()
+
+
+def request_stop() -> None:
+    """Ask the run to stop at its next safe boundary.
+
+    Signal handlers call this instead of raising. A ``raise`` from a handler
+    lands at whatever bytecode is executing, and if that happens to be a
+    weakref finalizer or ``__del__`` -- which matplotlib produces constantly
+    while rendering -- CPython prints "Exception ignored in ..." and
+    *discards* it, so the run carries on as though nothing happened. Setting
+    a flag and checking it between figures is deterministic.
+    """
+    _STOP.set()
+
+
+def clear_stop() -> None:
+    _STOP.clear()
+
+
+def stop_requested() -> bool:
+    return _STOP.is_set()
+
+
+def check_stop() -> None:
+    """Raise :class:`RunInterrupted` if a stop was requested."""
+    if _STOP.is_set():
+        raise RunInterrupted("stopped on request")
 
 STATE_FILENAME = ".render_state.json"
 INCOMPLETE_FILENAME = "INCOMPLETE.json"
@@ -214,6 +249,11 @@ def _remove(path: Path) -> None:
 
 __all__ = [
     "INCOMPLETE_FILENAME",
+    "RunInterrupted",
+    "check_stop",
+    "clear_stop",
+    "request_stop",
+    "stop_requested",
     "STALE_AFTER_SECONDS",
     "STATE_FILENAME",
     "find_recoverable",
