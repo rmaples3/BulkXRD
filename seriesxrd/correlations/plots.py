@@ -711,6 +711,7 @@ def _render_into(
     *,
     resume: bool = False,
     progress: bool = True,
+    state_dir: "Path | None" = None,
 ) -> List[Path]:
     """Render one sample tree into a staging directory.
 
@@ -728,6 +729,12 @@ def _render_into(
     )
     planned = len(specs)
     files: List[Path] = []
+    if state_dir is not None:
+        # Record the denominator before the first figure: a run that dies
+        # early must still be able to say "5 of 6183".
+        from . import checkpoint as _checkpoint
+
+        _checkpoint.write_state(state_dir, status="running", planned=planned)
     if resume:
         # A crash between savefig and os.replace can strand a *.png.tmp.
         for stray in base.rglob("*.png.tmp"):
@@ -741,6 +748,15 @@ def _render_into(
             files.append(path)
             if progress and (len(files) % 25 == 0 or len(files) == planned):
                 print(f"[CORRELATIONS] {len(files)} {planned}", flush=True)
+                if state_dir is not None:
+                    # Doubles as the heartbeat that tells a later session
+                    # whether this staging tree is still being written.
+                    from . import checkpoint as _checkpoint
+
+                    _checkpoint.write_state(
+                        state_dir, status="running",
+                        done=len(files), planned=planned,
+                    )
     return files
 
 
@@ -757,6 +773,7 @@ def render_all(
     *,
     max_anchor_plots: "int | None" = None,
     families: "Sequence[str] | None" = None,
+    resume: bool = False,
 ) -> List[str]:
     """Render and replace one sample's managed heatmap tree.
 
@@ -764,9 +781,18 @@ def render_all(
     exact ``heatmaps/<sample_type>`` directory swapped, so a rerun with fewer
     anchors/windows cannot leave stale PNGs. The sibling sample type is never
     touched.
+
+    The staging directory is the checkpoint. With ``resume=True`` a
+    compatible abandoned one is adopted and its finished figures skipped;
+    and an interrupted or failed render **keeps** its staging directory so
+    the work already done can be resumed or recovered rather than thrown
+    away.
     """
 
     import h5py  # type: ignore
+
+    from . import checkpoint as _checkpoint
+    from ..core.provenance import file_fingerprint
 
     source = Path(correlations_h5).expanduser().resolve()
     root = Path(heatmap_root).expanduser().resolve()
@@ -774,12 +800,39 @@ def render_all(
     with h5py.File(str(source), "r") as h5:
         sample_type = str(h5.attrs.get("sample_type", "unknown"))
     destination = root / sample_type
-    staging = Path(tempfile.mkdtemp(prefix=f".{sample_type}.tmp-", dir=str(root)))
+
+    fingerprint = file_fingerprint(source)
+    identity = {
+        "artifact": str(source),
+        "artifact_sha256": str(fingerprint.get("sha256", "")),
+        "artifact_bytes": int(fingerprint.get("bytes", -1)),
+        "max_anchor_plots": (
+            None if max_anchor_plots is None else int(max_anchor_plots)
+        ),
+        "families": list(families) if families else None,
+    }
+    staging = None
+    if resume:
+        for candidate in _checkpoint.find_staging(root.parent, sample_type):
+            state = _checkpoint.read_state(candidate)
+            if _checkpoint.is_live(candidate):
+                continue
+            if all(state.get(k) == v for k, v in identity.items()):
+                staging = candidate
+                break
+    if staging is None:
+        staging = Path(
+            tempfile.mkdtemp(prefix=_checkpoint.staging_prefix(sample_type),
+                             dir=str(root))
+        )
     backup = root / f".{sample_type}.old-{os.getpid()}"
     _remove_exact_path(backup)
+    _checkpoint.write_state(staging, status="running", sample_type=sample_type,
+                            **identity)
     try:
         staged_files = _render_into(
-            source, staging, max_anchor_plots, families
+            source, staging, max_anchor_plots, families,
+            resume=resume, state_dir=staging,
         )
         had_destination = destination.exists()
         if had_destination:
@@ -791,8 +844,13 @@ def render_all(
                 os.replace(backup, destination)
             raise
         _remove_exact_path(backup)
-    except Exception:
-        _remove_exact_path(staging)
+        _remove_exact_path(destination / _checkpoint.STATE_FILENAME)
+    except BaseException:
+        # Keep the staging tree: the figures already rendered are good, and
+        # discarding them is what made an interrupted export unresumable.
+        _checkpoint.write_state(
+            staging, status="interrupted", sample_type=sample_type, **identity
+        )
         raise
 
     output_parent = source.parent

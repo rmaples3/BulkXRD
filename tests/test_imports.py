@@ -34,6 +34,7 @@ mods = [
     'seriesxrd.analysis.spots',
     'seriesxrd.correlations', 'seriesxrd.correlations.processing',
     'seriesxrd.correlations.tracks', 'seriesxrd.correlations.export',
+    'seriesxrd.correlations.checkpoint',
     'seriesxrd.correlations.plots', 'seriesxrd.correlations.review',
     'seriesxrd.correlations.session', 'seriesxrd.correlations.batch',
     'seriesxrd.correlations.gui', 'seriesxrd.correlations.run_gui',

@@ -30,6 +30,11 @@ from ..core.processes import (
     terminate_process_tree,
     worker_popen,
 )
+from .checkpoint import (
+    find_recoverable as _find_recoverable,
+    mark_incomplete as _mark_incomplete,
+    publish_staging as _publish_staging,
+)
 from ..guikit import theme
 from ..guikit.mpl_embed import embed_figure
 from ..guikit.tkstyle import apply_theme
@@ -180,6 +185,72 @@ def _live_entries(artifact: Path) -> "list[Dict[str, Any]]":
                     method_label,
                     spec.label.casefold(),
                     spec.relpath.casefold(),
+                ),
+            }
+        )
+    return entries
+
+
+def _staged_entries(
+    record: Mapping[str, Any], result_root: Path
+) -> "list[Dict[str, Any]]":
+    """Browsable entries for figures stranded by an interrupted export.
+
+    Labeled distinctly at the top of the tree so a partial tree can never
+    be mistaken for a finished one.
+    """
+
+    staging = Path(record["staging"])
+    sample_type = str(record["sample_type"])
+    planned = int(record.get("planned", 0) or 0)
+    n_figures = int(record.get("n_figures", 0) or 0)
+    progress = f"{n_figures} of {planned}" if planned else f"{n_figures}"
+    sample_label = (
+        f"{'Powder' if sample_type == 'powder' else 'Single crystal'}"
+        f" — incomplete ({progress} figures from an interrupted run)"
+    )
+    entries: "list[Dict[str, Any]]" = []
+    for path in sorted(staging.rglob("*.png")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(staging)
+        category = relative.parts[0] if relative.parts else "other"
+        category_label = RESULT_CATEGORY_LABELS.get(
+            category, category.replace("_", " ").title()
+        )
+        pressure_label, pressure_value = (
+            _pressure_label(relative.parts[1])
+            if len(relative.parts) > 2
+            else ("All pressures", float("-inf"))
+        )
+        entries.append(
+            {
+                "source": "file",
+                "staged": True,
+                "spec": None,
+                "artifact": None,
+                "path": path,
+                "relative": relative,
+                "sample_type": sample_type,
+                "sample_label": sample_label,
+                "category": category,
+                "category_label": category_label,
+                "pressure_label": pressure_label,
+                "pressure_value": pressure_value,
+                "method_label": "",
+                "leaf_label": path.stem.replace("_", " ").title(),
+                "searchable": " ".join(
+                    (sample_label, category_label, str(relative), "incomplete")
+                ).casefold(),
+                "sort_key": (
+                    -1,  # recovered trees sort above finished results
+                    RESULT_CATEGORY_ORDER.get(
+                        category, len(RESULT_CATEGORY_ORDER)
+                    ),
+                    pressure_value,
+                    "",
+                    path.stem.casefold(),
+                    str(relative).casefold(),
                 ),
             }
         )
@@ -426,6 +497,7 @@ class CorrelationApp:
         self._live_canvas = None
         self._live_figure = None
         self._render_generation = 0
+        self._recoverable: "list[Dict[str, Any]]" = []
 
         self._build_gui()
         theme.register_widget_tree(self._embed_parent or self.root)
@@ -780,6 +852,10 @@ class CorrelationApp:
         ttk.Button(
             toolbar, text="Export CSV…", command=self._export_csv_clicked,
         ).pack(side="left", padx=2)
+        self._promote_button = ttk.Button(
+            toolbar, text="Promote staged…", command=self._promote_staged_clicked,
+        )
+        self._promote_button.pack(side="left", padx=2)
         self.results_status = ttk.Label(
             toolbar, text="No results loaded.", style="Muted.TLabel",
         )
@@ -1407,6 +1483,51 @@ class CorrelationApp:
         except Exception as exc:
             self.messagebox.showerror("Could not open folder", str(exc))
 
+    def _promote_staged_clicked(self):
+        """Publish figures left behind by an interrupted export."""
+        if self._run_proc is not None and self._run_proc.poll() is None:
+            self.messagebox.showinfo(
+                "Correlation results",
+                "A run is in progress — wait for it to finish first.",
+            )
+            return
+        if not self._recoverable:
+            self.messagebox.showinfo(
+                "Correlation results",
+                "No figures from an interrupted run were found.\n\n"
+                "Refresh the results if one has just stopped.",
+            )
+            return
+        record = self._recoverable[0]
+        planned = int(record.get("planned", 0) or 0)
+        total = f" of {planned}" if planned else ""
+        if not self.messagebox.askyesno(
+            "Promote staged figures",
+            f"Publish {record['n_figures']}{total} figure(s) recovered from "
+            f"an interrupted {record['sample_type']} run?\n\n"
+            "The result is incomplete and will be recorded as such.",
+        ):
+            return
+        root = Path(self._review_result_root or record["staging"].parent.parent)
+        destination = root / "heatmaps" / str(record["sample_type"])
+        artifact = root / f"correlations_{record['sample_type']}.h5"
+        try:
+            _publish_staging(record["staging"], destination)
+            _mark_incomplete(
+                destination,
+                n_figures=int(record["n_figures"]),
+                planned=planned,
+                source=str(record["staging"].name),
+                artifact=str(artifact) if artifact.is_file() else "",
+            )
+        except Exception as exc:
+            self.messagebox.showerror("Could not promote figures", str(exc))
+            return
+        self.log(
+            f"Promoted {record['n_figures']} staged figure(s) to {destination}"
+        )
+        self.review_results(show_errors=False, result_root=root)
+
     def _export_csv_clicked(self):
         """Write the summary CSV set for the reviewed artifact, off-thread."""
         root = self._review_result_root
@@ -1654,6 +1775,16 @@ class CorrelationApp:
                     )
                 except OSError as exc:
                     problems.append(str(exc))
+
+        # Figures stranded by an interrupted export are real results; show
+        # them, plainly marked, instead of hiding them because the run that
+        # made them never finished.
+        self._recoverable = _find_recoverable(result_root)
+        for record in self._recoverable:
+            try:
+                entries.extend(_staged_entries(record, result_root))
+            except OSError as exc:
+                problems.append(str(exc))
 
         self._review_result_root = result_root.resolve()
         self._result_entries = sorted(
