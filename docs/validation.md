@@ -159,6 +159,11 @@ These outputs are for guidance and screening, not for quantitative claims:
   from missing data: a finite zero denominator scores `0`, including the
   single-crystal both-zero case (two dead ROIs share absence, not
   similarity).
+- **Figures are derived, and provably so.** The same builder serves the
+  interactive canvas and the exported PNG, and a test asserts the two are
+  byte-identical for the same figure. Splitting building from saving was
+  verified not to move anything: every dataset, CSV and PNG of the
+  reference run hashes identically before and after.
 - **Tracks and transition intervals are exploratory.** Track linking reuses
   the Step-3c linker with the mutual ROI similarity as a second gate; with the
   gate unset that linker is pinned bit-identical to its historical behavior,

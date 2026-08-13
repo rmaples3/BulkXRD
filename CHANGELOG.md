@@ -7,6 +7,22 @@ semantic versioning once a stable public API is declared.
 
 ### Added
 
+- **Figures render on demand.** The Correlations Results page lists every
+  figure an artifact can draw — built from the artifact's own catalogue, not
+  from files on disk, so the list appears instantly with no PNGs written —
+  and renders the selected one into an embedded canvas with pan/zoom/save.
+  Figures are built on a worker thread and embedded on the main thread; a
+  generation counter drops and releases figures superseded by a newer
+  click. Pressure grouping now reads `/peaks/pressure` directly instead of
+  decoding it back out of folder names.
+- **Stop and resume.** Ctrl-C or the GUI's Cancel stops at the next figure
+  boundary, keeps everything already rendered, and exits 130 naming the
+  command that continues it. `--resume` reuses an existing artifact when
+  `/provenance` shows the same Analysis-file hash and compute settings, and
+  skips figures already on disk. Figures stranded by an interrupted run are
+  browsable in the Results tree under an "incomplete (interrupted run)"
+  heading and can be published with **Promote staged…**, which records
+  `INCOMPLETE.json` beside them.
 - **Correlations, a fourth pipeline stage** (`seriesxrd.correlations`, merged
   from the Log²-only MVP and hardened here): reads the Analysis HDF5 and
   writes a sample-specific `correlations_<sample>.h5` + manifest with a fixed
@@ -84,6 +100,22 @@ semantic versioning once a stable public API is declared.
 
 ### Changed
 
+- **Bulk PNG rendering is now off by default** (`--plots {all,none,FAMILY}`,
+  repeatable; `--no-plots` still accepted as a no-op). A run used to emit
+  3K+2W+M figures — thousands of files, hours of matplotlib — before
+  anything could be looked at, even though every number was already in the
+  artifact. Rendering is an explicit export; a run that writes none says so
+  and names the flag. **This changes behavior for existing scripts that
+  expected PNGs.**
+- **Figure building is separated from saving.** `plots.build_figure` returns
+  a canvas-less `Figure`; the exporter attaches Agg, the GUI attaches TkAgg.
+  One code path serves both, so a browsed figure and an exported PNG cannot
+  disagree — a test asserts they are byte-identical. Verified not to move
+  anything: every dataset, CSV and PNG of the reference run hashes the same
+  before and after. Large matrices are now sliced per figure rather than
+  loaded whole (the across-window matrices alone are ~370 MB each on a
+  1288-frame series), and the waterfall's per-frame O(frames×peaks) scan is
+  a single O(peaks) bucketing pass.
 - **The K×K ROI matrix is vectorized**: one closed-form pass per anchor over
   all targets replaces K² Python kernel calls (measured 1.6 s where the
   scalar loop extrapolates to ~12 min at K=900), pinned cell-for-cell against

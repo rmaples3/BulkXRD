@@ -315,7 +315,11 @@ Four pages expose the same supported batch contract as `seriesxrd-correlate`:
    streams its `[CORRELATIONS] done total` progress into a live progress
    bar; on success the completion line summarizes frames, valid anchors,
    windows, tracks, and PNGs from the run manifest.
-4. **Results** — provides a text search and a hierarchy of sample type →
+4. **Results** — lists every figure the artifact can draw, built from the
+   artifact itself rather than from files on disk, and renders the selected
+   one on demand into an embedded canvas with pan/zoom/save. The list
+   appears immediately even when no PNG has ever been written. It provides
+   a text search and a hierarchy of sample type →
    diagram type → pressure → image. ROI-area, location, and waterfall plots
    use the anchor pressure; within-frame window plots use the source frame's
    pressure. Across-frame window plots compare the full series and therefore
@@ -374,11 +378,23 @@ seriesxrd-correlate ANALYSIS.h5 --out RESULTS \
     --location-tolerance 0.02 --export-csv --max-anchor-plots 50
 ```
 
-Use `--no-plots` when only the sample-specific HDF5 and manifest are needed,
-`--max-anchor-plots N` to cap the per-anchor PNGs (the matrices stay complete
-in the HDF5), `--export-csv` / `--export-matrices` for spreadsheet-ready
-tables under `RESULTS/csv`, and `--no-tracks` to skip the exploratory
-ROI-gated peak tracks. Track linking reuses the Step-3c linker with the
+**Bulk PNG rendering is off by default.** Every number is in the artifact
+and the GUI draws figures on demand, so a routine run writes no images. Ask
+for files explicitly with `--plots all`, or name families
+(`--plots waterfall --plots tracks`); `--max-anchor-plots N` caps the
+per-anchor PNGs while leaving the matrices complete in the HDF5.
+`--no-plots` is still accepted and is now a no-op. Use `--export-csv` /
+`--export-matrices` for spreadsheet-ready tables under `RESULTS/csv`, and
+`--no-tracks` to skip the exploratory ROI-gated peak tracks.
+
+**Stopping and resuming.** Ctrl-C, or the GUI's Cancel, stops at the next
+figure boundary and keeps everything already rendered; the run exits 130
+and prints the command that continues it. Re-run with `--resume` to reuse
+the existing artifact — when the Analysis file and the compute settings are
+unchanged, verified through `/provenance` — and to skip figures already on
+disk. Figures stranded by a run that died appear in the GUI's Results tree
+under an "incomplete (interrupted run)" heading and can be published with
+**Promote staged…**, which records `INCOMPLETE.json` alongside them. Track linking reuses the Step-3c linker with the
 mutual ROI similarity `sqrt(S(A→B)·S(B→A))` as its evidence gate
 (`--track-min-similarity`, `0` = positional-only), links only within
 `--track-group-by` groups, and screens adjacent ordered intervals for

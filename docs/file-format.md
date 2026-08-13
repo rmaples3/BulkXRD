@@ -329,6 +329,19 @@ standardized (`core/provenance.manifest_provenance`):
 `seriesxrd_version` is the package version that wrote the artifact;
 `schema_version` only changes when the file layout changes.
 
+The correlation manifest also records `plots` (the figure families the run
+was asked to write; empty is the default), and, for a resumed run,
+`resumed`/`resumed_at`. A run interrupted before it wrote a manifest leaves
+none, so a later `--resume` rebuilds the summary from the artifact and marks
+it `manifest_rebuilt_from_artifact`.
+
+An interrupted figure export leaves a `heatmaps/.<sample>.tmp-*` staging
+directory holding the figures it finished, with a `.render_state.json`
+recording the run's identity, its planned figure count, and a heartbeat.
+Promoting such a tree writes `INCOMPLETE.json` beside the figures, naming
+the counts and the artifact they came from, so a partial result is never
+mistaken for a complete one.
+
 Manifest fields listing generated files (the correlation stage's
 `plot_files` and `csv_files`) hold paths relative to the run's output
 directory, written with forward slashes on every platform so the manifest

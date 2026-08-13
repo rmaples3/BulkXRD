@@ -142,8 +142,13 @@ Analysis background-corrected source
            screening
 ```
 
-`correlations/tracks.py` supplies the linking/screening layer and
-`correlations/export.py` the CSV exports; both are headless. The stage never
+`correlations/tracks.py` supplies the linking/screening layer,
+`correlations/export.py` the CSV exports, and `correlations/checkpoint.py`
+the stop flag and staging-tree recovery; all are headless. Figure building
+is separate from saving: `plots.build_figure` returns a canvas-less
+`Figure` that the exporter saves through Agg and the GUI embeds through
+TkAgg, so one code path serves files and the interactive canvas, and the
+module stays importable where there is no display. The stage never
 grows a second track linker — the one in `analysis/unknowns.py` gained an
 optional similarity gate instead, inert for Step 3c.
 
