@@ -1458,7 +1458,11 @@ class CorrelationApp:
         self.run_status.configure(text="Stopping…", style="Muted.TLabel")
         # Longer than the default: the worker stops at the next figure
         # boundary and keeps what it finished, and a large waterfall can
-        # take a moment. A SIGKILL mid-figure only costs that one figure.
+        # take a moment. A hard kill mid-figure only costs that one figure —
+        # the staging tree survives either way and stays recoverable.
+        # (On Windows terminate_process_tree caps its CTRL_BREAK grace at
+        # 0.75 s before falling back to taskkill; that cap is shared with
+        # the other stages, so it is left alone here.)
         terminate_process_tree(process, timeout=5.0)
 
     # ------------------------------------------------------------------

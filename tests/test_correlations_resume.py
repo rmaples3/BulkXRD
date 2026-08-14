@@ -183,6 +183,8 @@ def test_sigterm_stops_gracefully_and_resume_finishes(tmp_path):
     import sys
     import time
 
+    from seriesxrd.core.processes import worker_popen
+
     analysis = _write_analysis(tmp_path / "analysis.h5")
     out = tmp_path / "res"
     argv = [
@@ -190,7 +192,10 @@ def test_sigterm_stops_gracefully_and_resume_finishes(tmp_path):
         "--out", str(out), "--sample-type", "powder", "--plots", "all",
     ]
     env = dict(os.environ, MPLBACKEND="Agg")
-    proc = subprocess.Popen(
+    # Launch exactly as the GUI does: worker_popen puts the child in its own
+    # process group on Windows, which is what makes CTRL_BREAK_EVENT
+    # deliverable to it and to nothing else.
+    proc = worker_popen(
         argv, cwd=str(Path(__file__).resolve().parents[1]), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
@@ -210,7 +215,13 @@ def test_sigterm_stops_gracefully_and_resume_finishes(tmp_path):
         proc.wait(timeout=30)
         pytest.skip("render finished before it could be interrupted")
 
-    proc.send_signal(signal.SIGTERM)
+    # Ask for a graceful stop the way each platform can actually deliver
+    # one. On Windows SIGTERM is not a signal at all: Popen.send_signal
+    # maps it to TerminateProcess, which runs no handler and exits 1.
+    if os.name == "nt":
+        proc.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        proc.send_signal(signal.SIGTERM)
     output = proc.communicate(timeout=60)[0]
     assert proc.returncode == 130, output
     assert "--resume" in output

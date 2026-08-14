@@ -275,7 +275,16 @@ def main(argv: "list[str] | None" = None) -> int:
             flush=True,
         )
 
-    for signum in (signal.SIGTERM, signal.SIGINT):
+    # SIGBREAK matters on Windows: SIGTERM is not deliverable there
+    # (Popen.send_signal(SIGTERM) is TerminateProcess, which runs no
+    # handler), so a supervisor asks for a graceful stop with
+    # CTRL_BREAK_EVENT -- which arrives as SIGBREAK. core.processes
+    # launches workers with CREATE_NEW_PROCESS_GROUP and sends exactly
+    # that, so registering it is what makes Cancel graceful on Windows.
+    handled = [signal.SIGTERM, signal.SIGINT]
+    if hasattr(signal, "SIGBREAK"):
+        handled.append(signal.SIGBREAK)
+    for signum in handled:
         try:
             previous[signum] = signal.signal(signum, _graceful)
         except (ValueError, OSError):   # non-main thread / exotic platform
