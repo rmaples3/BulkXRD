@@ -142,6 +142,42 @@ def test_log_squared_is_fixed_bounded_and_uses_one_scale():
     assert np.nanmin(transformed) >= 0.0 and np.nanmax(transformed) <= 1.0
 
 
+def test_log_squared_saturates_exactly_at_one():
+    """The bound is exact, not exact-to-an-ULP.
+
+    The numerator uses numpy's log1p and the denominator the scalar one;
+    for the same argument those can disagree by an ULP on some numpy
+    builds, which showed up as 0.9999999999999998 at saturation on the
+    lowest-supported-dependency job. Saturation is pinned so the [0, 1]
+    bound holds exactly and the artifact does not depend on which log1p
+    the local numpy chose.
+    """
+    for noise, scale in ((1.0, 10.0), (0.5, 3.0), (2.0, 7.5)):
+        values = np.asarray([[scale, 2.0 * scale, 0.0, -scale]])
+        transformed, params = log_squared_transform(
+            values, scale=scale, noise_floor=noise
+        )
+        assert transformed[0, 0] == 1.0        # exactly at the scale
+        assert transformed[0, 1] == 1.0        # above it, clipped
+        assert transformed[0, 2] == 0.0
+        assert transformed[0, 3] == 0.0        # negatives map to zero
+        assert np.nanmax(transformed) <= 1.0
+        assert params.epsilon > 0.0
+
+    # The signed window path shares the transform, so it saturates too.
+    from seriesxrd.correlations.processing import _signed_log_squared_transform
+
+    _, params = log_squared_transform(
+        np.asarray([[10.0]]), scale=10.0, noise_floor=1.0
+    )
+    signed = _signed_log_squared_transform(
+        np.asarray([[-20.0, -10.0, 0.0, 10.0, 20.0]]), params
+    )
+    assert signed[0, 0] == 1.0 and signed[0, 4] == 1.0
+    assert signed[0, 1] == 1.0 and signed[0, 3] == 1.0
+    assert signed[0, 2] == 0.0
+
+
 def test_core_similarity_contracts_include_scalar_location():
     x = np.linspace(-1.0, 1.0, 21)
     peak = np.exp(-0.5 * (x / 0.25) ** 2)

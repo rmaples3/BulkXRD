@@ -280,6 +280,23 @@ def _estimate_noise_floor(values: np.ndarray) -> float:
     return float(np.median(estimates)) if estimates else 0.0
 
 
+def _bounded_log_squared(z: np.ndarray, epsilon: float) -> np.ndarray:
+    """``log1p(z^2/eps) / log1p(1/eps)``, saturating exactly at 1.
+
+    The normalization constant exists precisely so that ``|z| = 1`` maps to
+    1, but the numerator goes through numpy's (possibly SIMD) ``log1p`` and
+    the denominator through the scalar one, and the two implementations may
+    disagree by an ULP for the same argument — which they do on some numpy
+    builds, returning 0.9999999999999998 at saturation. Pinning the
+    saturation point keeps the documented [0, 1] bound exact and keeps the
+    artifact reproducible across numpy versions rather than only within one.
+    """
+
+    scaled = np.log1p((z * z) / epsilon) / math.log1p(1.0 / epsilon)
+    scaled = np.clip(scaled, 0.0, 1.0)
+    return np.where(np.abs(z) >= 1.0, 1.0, scaled)
+
+
 def log_squared_transform(
     values: np.ndarray,
     *,
@@ -316,8 +333,7 @@ def log_squared_transform(
     output = np.full(array.shape, np.nan, dtype=float)
     valid = np.isfinite(array)
     z = np.clip(np.maximum(array[valid], 0.0) / float(scale), 0.0, 1.0)
-    output[valid] = np.log1p((z * z) / epsilon) / math.log1p(1.0 / epsilon)
-    output[valid] = np.clip(output[valid], 0.0, 1.0)
+    output[valid] = _bounded_log_squared(z, epsilon)
     params = TransformParameters(
         method="log_squared",
         scale=float(scale),
@@ -344,10 +360,7 @@ def _signed_log_squared_transform(
     output = np.full(array.shape, np.nan, dtype=float)
     valid = np.isfinite(array)
     z = np.clip(array[valid] / parameters.scale, -1.0, 1.0)
-    output[valid] = np.log1p((z * z) / parameters.epsilon) / math.log1p(
-        1.0 / parameters.epsilon
-    )
-    output[valid] = np.clip(output[valid], 0.0, 1.0)
+    output[valid] = _bounded_log_squared(z, parameters.epsilon)
     return output
 
 
