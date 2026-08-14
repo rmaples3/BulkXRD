@@ -7,27 +7,37 @@ For the HDF5 layouts each stage reads and writes, see
 
 ## Stage pattern
 
-The pipeline is one subpackage per stage — `calib`, `reduce`, `analysis` —
+The pipeline is one subpackage per stage — `calib`, `reduce`, `analysis`,
+`correlations` —
 communicating only through artifacts on disk plus a shared workspace folder.
 Every stage follows the same internal convention:
 
 | Module | Role |
 |---|---|
 | `processing.py` | Pure logic. No GUI, no subprocess — importable and headless, so the stage can run as a batch job. |
-| `worker.py` | Crash-isolated subprocess wrapper. Heavy pyFAI/matplotlib work runs here, so a native-code crash is contained in the worker process rather than in the GUI. |
+| `worker.py` or `batch.py` | Crash-isolated subprocess entry point. Heavy pyFAI/matplotlib/numerical work runs here, so a native-code crash is contained rather than taking down the GUI. |
 | `gui.py` | Embeddable Tkinter pane. With `parent=None` it owns its root window; otherwise it embeds into the unified application. |
 | `run_gui.py` | Standalone CLI entry point for the stage GUI. |
 | `session.py` | Workspace config seeding and handoff reading. |
 
-The unified application (`seriesxrd.app`) embeds all three stage panes in one
+The unified application (`seriesxrd.app`) embeds all four stage panes in one
 window. Stage handoffs are automatic: an accepted calibration writes
 `calibration_handoff.json` (PONI + mask + QA record) that the Reduction tab
-loads; a finished reduction hands its output HDF5 to the Analysis tab.
+loads; a finished reduction hands its output HDF5 to Analysis; a finished
+analysis hands its Analysis HDF5 to Correlations. These handoffs pass paths to
+artifacts on disk, not in-memory scientific arrays.
 
 Shared code lives in `core/` (config, environment checks, naming, detector
 I/O and HDF5/NeXus stack ingestion, masks, handoff contract, provenance) and
 `guikit/` (theme, ttk styling, tooltips, DPI awareness, embedded matplotlib
 figures) — `core/` depends only on the stdlib and numpy.
+
+Analysis frame drivers use `analysis.parallel.process_map_or_serial`: they
+attempt ordered process-pool execution first, but automatically repeat the
+same payload sequence serially when the operating system cannot create the
+pool's semaphore resources. Results are collected before they are handed to
+the caller, so fallback cannot mix partial parallel and serial outputs. A
+genuine calculation exception is raised again by the serial run.
 
 ### UI theming
 
@@ -108,6 +118,67 @@ gap-tolerant tracks across the series (they drift coherently if they belong
 to a real phase), and tracks that appear/disappear/drift together are
 clustered by co-occurrence into candidate unknown phases, each with a
 d-spacing fingerprint and candidate transition frames.
+
+## Correlation pipeline
+
+`seriesxrd.correlations` is a separate fourth stage that consumes the public
+Analysis-HDF5 contract. It does not import or execute external,
+experiment-specific research scripts. The formal stage is headless at its core
+and is exposed through both `seriesxrd-correlate` and an embeddable Tk pane.
+
+The numerical sequence is deliberately fixed:
+
+```text
+Analysis background-corrected source
+        -> one pooled scale and noise-derived epsilon
+        -> positive clipping + bounded Log² for ROI-area maps
+        -> signed residual clipping to [-1, 1] + bounded Log² for windows
+        -> all-observation ROI-area maps (same-frame cells omitted)
+        -> independent geometric location maps
+        -> original-positive waterfall + Log²-derived shading
+        -> direct and standardized positive-lag FFT-ACF window correlations
+        -> ROI-gated peak tracks (analysis.unknowns.link_tracks + the mutual
+           ROI similarity as its evidence gate) + exploratory transition
+           screening
+```
+
+`correlations/tracks.py` supplies the linking/screening layer,
+`correlations/export.py` the CSV exports, and `correlations/checkpoint.py`
+the stop flag and staging-tree recovery; all are headless. Figure building
+is separate from saving: `plots.build_figure` returns a canvas-less
+`Figure` that the exporter saves through Agg and the GUI embeds through
+TkAgg, so one code path serves files and the interactive canvas, and the
+module stays importable where there is no display. The stage never
+grows a second track linker — the one in `analysis/unknowns.py` gained an
+optional similarity gate instead, inert for Step 3c.
+
+Powder anchors are the retained `/peaks` rows. Single-crystal anchors are the
+`/spots/obs` rows. Track identifiers may be recorded but never collapse the
+all-peak/all-observation calculation. Single-crystal mode selects `spots` by
+default in the GUI and CLI; its ROI feature is a one-dimensional radial
+approximation, not the prototype's raw-pixel ROI. Location similarity is not
+Log²-derived: it depends only on peak centers and a native-axis tolerance.
+Peak cells belonging to the anchor frame are structural `NaN` values and are
+blank in review plots.
+
+FFT autocorrelation fingerprints are standardized and contain positive lags
+only; lag zero is excluded. Window width and step use the HDF5 native radial
+unit, and width cannot exceed the selected radial span. The supported MVP does
+not migrate the prototype's `shift_tolerant_secondary` diagnostic or its
+same-scan aggregation: the public Analysis HDF5 has no stable `scan_id` on
+which to base that aggregation.
+
+`correlations_powder.h5` and `correlations_single_crystal.h5` are the numeric
+sources of truth. Their manifests are `manifest_powder.json` and
+`manifest_single_crystal.json`; both pairs can coexist in one result folder.
+PNG heatmaps remain replaceable review artifacts under
+`heatmaps/<sample_type>`. HDF5 and manifest writers use temporary files
+followed by `os.replace`, matching the pipeline's atomic-output policy.
+The GUI indexes those PNGs into a searchable sample-type → diagram-type →
+pressure hierarchy. Across-frame window maps are categorized as **All
+pressures**, while within-frame maps inherit their frame pressure. Window-map
+PNGs mask the diagonal and one mirrored half of each symmetric matrix; this
+review mask never changes the complete square arrays stored in HDF5.
 
 ### Simulation physics conventions (Step 3b)
 

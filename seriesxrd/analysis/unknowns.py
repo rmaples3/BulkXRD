@@ -183,7 +183,9 @@ def link_tracks(frames: np.ndarray, centers: np.ndarray, amplitudes: np.ndarray,
                 tracking_axis: str = "frame",
                 max_axis_gap: "Optional[float]" = None,
                 axis_predictor: bool = True,
-                group_values: "Optional[np.ndarray]" = None) -> "List[Dict[str, np.ndarray]]":
+                group_values: "Optional[np.ndarray]" = None,
+                similarity: "Optional[Any]" = None,
+                min_similarity: float = 0.0) -> "List[Dict[str, np.ndarray]]":
     """Chain per-frame residual peaks into cross-frame/physical-axis tracks.
 
     Greedy one-to-one linking, closest pair first: a peak joins an open track
@@ -196,7 +198,21 @@ def link_tracks(frames: np.ndarray, centers: np.ndarray, amplitudes: np.ndarray,
     observations. ``group_values`` separates independent scans/runs: tracks are
     closed at group boundaries and never link across them. Tracks observed in
     fewer than ``min_track_frames`` frames are discarded as noise. Returns one
-    dict per kept track: ``{frames, centers, amplitudes, fwhms, axis, group}``.
+    dict per kept track:
+    ``{frames, centers, amplitudes, fwhms, axis, group, rows}`` where ``rows``
+    are the source observation indices of the linked peaks.
+
+    ``similarity`` optionally adds a second, evidence-based gate on top of the
+    position gate: a callable ``(row_last, row_candidate) -> float`` scored
+    between a track's most recent observation row and a candidate row (the
+    correlations stage passes its mutual ROI similarity). A candidate is
+    rejected unless the score is finite and ``>= min_similarity`` — NaN means
+    no usable evidence and rejects while the gate is active. Geometry stays
+    the primary prior: candidates are still consumed closest first, with the
+    similarity only breaking distance ties (a blended score would silently
+    re-rank well-separated candidates and make the gate impossible to reason
+    about). With ``similarity=None`` (the default) linking is bit-identical
+    to the historical position-only behavior.
     """
     frames = np.asarray(frames, int)
     centers = np.asarray(centers, float)
@@ -266,20 +282,35 @@ def link_tracks(frames: np.ndarray, centers: np.ndarray, amplitudes: np.ndarray,
             open_tracks = still
             if rows.size == 0:
                 continue
-            # Candidate (gap, track, row) pairs within tolerance, closest first.
-            cands: List[Tuple[float, int, int]] = []
+            # Candidate (gap, [similarity,] track, row) tuples within
+            # tolerance, closest first. Without the similarity gate the tuple
+            # shape and sort are the historical ones, so linking stays
+            # bit-identical for Step 3c.
+            use_gate = similarity is not None
+            cands: List[Tuple] = []
             for ti, t in enumerate(open_tracks):
                 c_last = _predict_center(t, axis_now, use_axis_predictor=use_predictor)
                 w_last = t["fwhms"][-1]
                 for r in rows:
                     tol = float(link_tol_fwhm) * max(w_last, fwhms[r], 1e-9)
                     g = abs(centers[r] - c_last)
-                    if g <= tol:
+                    if g > tol:
+                        continue
+                    if use_gate:
+                        score = float(similarity(int(t["rows"][-1]), int(r)))
+                        if not np.isfinite(score) or score < float(min_similarity):
+                            continue
+                        cands.append((g, -score, ti, int(r)))
+                    else:
                         cands.append((g, ti, int(r)))
-            cands.sort(key=lambda x: x[0])
+            if use_gate:
+                cands.sort()
+            else:
+                cands.sort(key=lambda x: x[0])
             used_t: set = set()
             used_r: set = set()
-            for g, ti, r in cands:
+            for cand in cands:
+                ti, r = cand[-2], cand[-1]
                 if ti in used_t or r in used_r:
                     continue
                 used_t.add(ti)
@@ -292,6 +323,7 @@ def link_tracks(frames: np.ndarray, centers: np.ndarray, amplitudes: np.ndarray,
                 t["axis"].append(axis_now)
                 t["group"].append(int(group_id))
                 t["order"].append(int(order_pos))
+                t["rows"].append(int(r))
             for r in rows:
                 if int(r) not in used_r:             # unmatched peak → new track
                     open_tracks.append({"frames": [fi],
@@ -300,7 +332,8 @@ def link_tracks(frames: np.ndarray, centers: np.ndarray, amplitudes: np.ndarray,
                                         "fwhms": [float(fwhms[r])],
                                         "axis": [axis_now],
                                         "group": [int(group_id)],
-                                        "order": [int(order_pos)]})
+                                        "order": [int(order_pos)],
+                                        "rows": [int(r)]})
         done.extend(open_tracks)
         all_done.extend(done)
 

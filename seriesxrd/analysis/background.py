@@ -28,13 +28,12 @@ Pure-numpy logic (no pyFAI). ``separate_background`` works on a single pattern;
 from __future__ import annotations
 
 import re
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
 
-from .parallel import resolve_workers, chunk_ranges
+from .parallel import chunk_ranges, process_map_or_serial, resolve_workers
 from ..core.config import VERSION, now_iso
 from ..core.provenance import manifest_provenance, write_provenance
 
@@ -435,11 +434,14 @@ def run_background_separation(
         payloads = [(mean_all[a:b], robust_all[a:b], max_half_window, n_passes, use_lls)
                     for a, b in ranges]
         done = 0
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            for (a, b), (c, bs, sp, ct) in zip(ranges, ex.map(_bg_chunk, payloads)):
-                clean[a:b] = c; baseline[a:b] = bs; spots[a:b] = sp; contam[a:b] = ct
-                done += (b - a)
-                print(f"[ANALYSIS] {done} {n}", flush=True)
+        # Lazy iterator: the [ANALYSIS] progress lines below stream only while
+        # results are consumed one chunk at a time -- do not materialize it.
+        results = process_map_or_serial(
+            _bg_chunk, payloads, max_workers=workers, label="ANALYSIS")
+        for (a, b), (c, bs, sp, ct) in zip(ranges, results):
+            clean[a:b] = c; baseline[a:b] = bs; spots[a:b] = sp; contam[a:b] = ct
+            done += (b - a)
+            print(f"[ANALYSIS] {done} {n}", flush=True)
     else:
         for i in range(n):
             res = separate_background(mean_all[i], robust_all[i],

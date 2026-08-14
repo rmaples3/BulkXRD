@@ -13,7 +13,11 @@ from ..core.config import (
     now_iso, now_timestamp, output_base,
 )
 from ..core.naming import next_available_path
-from ..core.processes import terminate_process_tree, worker_popen
+from ..core.processes import (
+    open_in_file_manager,
+    terminate_process_tree,
+    worker_popen,
+)
 from ..guikit import theme
 from ..guikit.tkstyle import apply_theme
 from ..guikit.tooltip import ToolTip as _ToolTip
@@ -323,6 +327,9 @@ class AnalysisApp:
 
         self.vars: Dict[str, Any] = {}
         self._run_proc: "subprocess.Popen | None" = None
+        # Host applications can subscribe to a completed Analysis HDF5 without
+        # coupling the analysis worker to the next workflow stage.
+        self._analysis_listeners: "list[Any]" = []
         # Thread-safe logging: worker threads push lines here; a main-thread
         # poller drains them into the Text widget.
         self._log_queue: "queue.Queue[str]" = queue.Queue()
@@ -1009,6 +1016,23 @@ class AnalysisApp:
         if Path(p).is_file():
             self.root.after(100, self.inspect_input_clicked)
 
+    def add_analysis_listener(self, fn) -> None:
+        """Register a callback invoked after a successful analysis run."""
+        if not callable(fn):
+            raise TypeError("analysis listener must be callable")
+        self._analysis_listeners.append(fn)
+
+    def _notify_analysis_ready(self, path: "str | Path") -> None:
+        """Notify downstream stages while keeping listener failures isolated."""
+        p = str(path or "").strip()
+        if not p or not Path(p).is_file():
+            return
+        for listener in tuple(self._analysis_listeners):
+            try:
+                listener(p)
+            except Exception as exc:
+                self.log(f"Analysis handoff listener failed: {exc!r}", "WARN")
+
     # ------------------------------------------------------------------
     # Tab 2 — Background
     # ------------------------------------------------------------------
@@ -1232,13 +1256,7 @@ class AnalysisApp:
             self.log("No output folder to open yet.", "WARN")
             return
         try:
-            if sys.platform.startswith("win"):
-                import os as _os
-                _os.startfile(str(folder))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(folder)])
-            else:
-                subprocess.Popen(["xdg-open", str(folder)])
+            open_in_file_manager(folder)
         except Exception as exc:
             self.log(f"Could not open {folder}: {exc!r}", "WARN")
 
@@ -1442,6 +1460,7 @@ class AnalysisApp:
             if "analysis_h5_file" in self.vars:
                 self.vars["analysis_h5_file"].set(h5)
             self.save_config(silent=True)
+            self._notify_analysis_ready(h5)
             # Log peak summary if Step 2 ran.
             s2 = manifest.get("step2", {})
             if s2:

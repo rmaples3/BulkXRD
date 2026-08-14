@@ -6,11 +6,11 @@
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21479736.svg)](https://doi.org/10.5281/zenodo.21479736)
 [![License: MIT](https://img.shields.io/pypi/l/seriesxrd.svg)](LICENSE)
 
-GUI-driven workflow for powder X-ray diffraction: detector calibration review,
-dataset reduction, and pattern analysis. Facility-neutral by design — it works
-the same way for a synchrotron beamline or a lab (in-house) diffractometer,
-any calibrant, any detector pyFAI supports, and any beamline-specific frame
-naming or metadata convention (see "Site adoption" in
+GUI-driven workflow for diffraction series: detector calibration review,
+dataset reduction, pattern analysis, and correlation mapping. Facility-neutral
+by design — it works the same way for a synchrotron beamline or a lab
+(in-house) diffractometer, any calibrant, any detector pyFAI supports, and any
+beamline-specific frame naming or metadata convention (see "Site adoption" in
 [`docs/roadmap.md`](docs/roadmap.md) for exactly what a new site needs to
 supply). A single unified desktop application (`seriesxrd`) hosts all pipeline
 stages in one window. Heavy pyFAI work runs in separate `worker.py`
@@ -48,6 +48,20 @@ on disk plus a shared workspace folder:
    clustering of the leftover residual (Step 3c). Semi-quantitative phase
    fractions, azimuthal texture metrics, and a Rietveld hand-off export round
    out the tooling.
+4. **`seriesxrd.correlations`** — Log²-only correlation mapping from an
+   Analysis HDF5: all-peak ROI-area and peak-location maps, original-positive
+   waterfall traces shaded by the positive-Log² ROI result, and
+   window-to-window maps from signed-residual Log². Both transforms share one
+   pooled scale and epsilon. Powder observations come from `/peaks`;
+   single-crystal observations come from `/spots/obs` and use a documented 1D
+   radial ROI approximation. Numerical results are written to
+   `correlations_powder.h5` or `correlations_single_crystal.h5`, with matching
+   `manifest_powder.json` or `manifest_single_crystal.json` files and review
+   PNGs kept in the workspace. The Results browser is searchable and groups
+   images by sample type, diagram type, and pressure. Across-frame window maps
+   appear under **All pressures**; within-frame maps use that frame's pressure.
+   Square window-map PNGs show only the strict lower triangle and hide the
+   known-one diagonal, while the HDF5 keeps each complete numeric matrix.
 
 The calib→reduce handoff JSON is an internal artifact written to the workspace
 and automatically loaded by the Reduction tab — users do not need to manage it
@@ -87,8 +101,9 @@ manually.
 │   │   ├── gui.py           tabbed Tkinter GUI (embeddable pane)
 │   │   └── run_gui.py       CLI entry point (seriesxrd-reduce-gui)
 │   ├── app.py           unified application (seriesxrd entry point)
-│   └── analysis/        analysis stage (background, peaks, identification,
-│                        maps, ML ranking/training, and exports)
+│   ├── analysis/        analysis stage (background, peaks, identification,
+│   │                    maps, ML ranking/training, and exports)
+│   └── correlations/    Log² correlations, heatmaps, CLI, and native GUI pane
 ├── tests/               automated pytest suite
 ├── examples/            calibration_session_config.example.json (schema reference),
 │                        fetch_benchmark_example.sh (downloads a real-data
@@ -97,9 +112,9 @@ manually.
 └── pyproject.toml       package metadata + pip dependencies
 ```
 
-Stage convention: pure logic modules + a crash-isolated `worker.py` + an
-embeddable `gui.py` pane. Logic stays importable and headless so stages can
-also run as batch jobs without any GUI.
+Stage convention: pure logic modules + a crash-isolated worker/batch entry
+point + an embeddable `gui.py` pane. Logic stays importable and headless so
+stages can also run as batch jobs without any GUI.
 
 ## Installation
 
@@ -138,17 +153,16 @@ seriesxrd-gui --workspace <dir>
 python -m seriesxrd.app --workspace <dir>
 ```
 
-Opens one window with **1 Calibration**, **2 Reduction**, and **3 Analysis**
-tabs. Accepting a calibration hands its PONI + mask to the Reduction tab
-automatically; a finished reduction hands its output HDF5 to the Analysis
-tab automatically — the handoffs are automatic in both directions, not a
-manual file-picking step. The workspace folder holds the stage configs and
-all outputs. On first launch the configs are auto-created with sensible
-defaults.
+Opens one window with **1 Calibration**, **2 Reduction**, **3 Analysis**, and
+**4 Correlations** tabs. Accepting a calibration hands its PONI + mask to the
+Reduction tab automatically; a finished reduction hands its output HDF5 to
+the Analysis tab, and a finished analysis hands its Analysis HDF5 to
+Correlations. The workspace folder holds the stage configs and all outputs.
+On first launch the configs are auto-created with sensible defaults.
 
-The GUI embeds all three stage panes in one process; heavy pyFAI work runs
-in `worker.py` subprocesses (one per stage), so a worker crash is isolated
-from the host window and from the other stages.
+The GUI embeds all four stage panes in one process; scientific runs execute in
+subprocesses, so a worker crash is isolated from the host window and the other
+stages.
 
 ### End-to-end demonstration data
 
@@ -165,6 +179,7 @@ Each stage also has a standalone entry point for advanced use:
 seriesxrd-calib-gui    --config <path/to/calibration_session_config.json>
 seriesxrd-reduce-gui   --config <path/to/reduction_session_config.json>
 seriesxrd-analysis-gui --config <path/to/analysis_session_config.json>   # optional; auto-found if omitted
+seriesxrd-correlations-gui --config <path/to/correlation_session_config.json>
 ```
 
 ### Detector-image diagnostic
@@ -175,13 +190,21 @@ seriesxrd-inspect <image_file>
 python -m seriesxrd.core.inspect <image_file>
 ```
 
-### Headless analysis + ML training
+### Headless analysis, correlations, and ML training
 
 ```bash
 seriesxrd-analyze reduced.h5 --phases Au,Re          # Steps 1-3a, no GUI
 seriesxrd-analyze reduced.h5 --ml-rank               # candidate-free: rank whole library
+seriesxrd-correlate analysis.h5 --out results/correlations --sample-type powder
+seriesxrd-correlate analysis.h5 --out results/correlations --sample-type single_crystal --source spots
 seriesxrd-ml-train --workspace <dir> --out scorer.pt # train the learned scorer
 ```
+
+The GUI and CLI select/recommend `spots` for single-crystal runs. Powder and
+single-crystal numerical outputs can safely share one result directory;
+neither sample type overwrites the other. Before a single-crystal correlation
+run, add `/spots/obs` with
+`seriesxrd-spots REDUCED.h5 --analysis ANALYSIS.h5`.
 
 Training the Step-3b learned scorer (data collection, environment setup,
 corpus building, validation gates, deployment) is documented in
@@ -191,12 +214,14 @@ corpus building, validation gates, deployment) is documented in
 
 | Command | Purpose |
 |---|---|
-| `seriesxrd` | Unified GUI: Calibration + Reduction + Analysis tabs in one window. |
+| `seriesxrd` | Unified GUI: Calibration + Reduction + Analysis + Correlations in one window. |
 | `seriesxrd-gui` | Unified GUI without a console window on supported desktop platforms. |
 | `seriesxrd-calib-gui` | Calibration stage standalone GUI. |
 | `seriesxrd-reduce-gui` | Reduction stage standalone GUI (includes live watch-mode controls). |
 | `seriesxrd-analysis-gui` | Analysis stage standalone GUI. |
+| `seriesxrd-correlations-gui` | Correlations stage standalone GUI. |
 | `seriesxrd-analyze` | Headless analysis CLI (Steps 1-3, ML ranking, exports). |
+| `seriesxrd-correlate` | Headless fixed-Log² correlation mapping from an Analysis HDF5. |
 | `seriesxrd-watch` | Live reduction + rolling analysis while frames are still being collected. |
 | `seriesxrd-ml-train` | Train the Step-3b learned candidate scorer. |
 | `seriesxrd-benchmark` | Score a scorer against labelled XY patterns (RRUFF/opXRD-style known-truth harness). |

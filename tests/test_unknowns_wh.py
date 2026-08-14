@@ -195,6 +195,66 @@ def test_track_linking_gap_tolerance():
     assert len(tr2) == 2                    # gap too wide -> split
 
 
+def test_link_tracks_similarity_defaults_are_inert():
+    """Without a similarity gate, linking (incl. the equal-gap tie-break) is
+    the historical position-only behavior, and tracks now carry their source
+    observation rows."""
+    # Frame 0 opens two tracks; frame 1 has ONE peak exactly equidistant from
+    # both. The stable gap-only sort makes the first-opened track win.
+    frames = np.array([0, 0, 1])
+    centers = np.array([1.0, 2.0, 1.5])
+    amps = np.array([10.0, 5.0, 1.0])
+    fwhms = np.full(3, 0.5)
+    tracks = link_tracks(frames, centers, amps, fwhms, n_frames=2,
+                         min_track_frames=1)
+    assert len(tracks) == 2
+    # Sorted by descending amplitude sum: the winner absorbed the tied peak.
+    assert tracks[0]["rows"].tolist() == [0, 2]
+    assert tracks[0]["centers"].tolist() == [1.0, 1.5]
+    assert tracks[1]["rows"].tolist() == [1]
+
+
+def test_link_tracks_similarity_gate_accepts_and_rejects():
+    """The ROI-similarity gate re-decides the equal-gap tie on evidence,
+    rejects non-finite scores, and keeps linking one-to-one."""
+    frames = np.array([0, 0, 1])
+    centers = np.array([1.0, 2.0, 1.5])
+    amps = np.array([10.0, 5.0, 1.0])
+    fwhms = np.full(3, 0.5)
+
+    # Evidence says the tied peak belongs to the SECOND track.
+    scores = {(0, 2): 0.05, (1, 2): 0.9}
+    tracks = link_tracks(
+        frames, centers, amps, fwhms, n_frames=2, min_track_frames=1,
+        similarity=lambda a, b: scores.get((a, b), np.nan),
+        min_similarity=0.2,
+    )
+    rows = sorted(t["rows"].tolist() for t in tracks)
+    assert rows == [[0], [1, 2]]
+
+    # NaN = no usable evidence: while the gate is active nothing links.
+    tracks = link_tracks(
+        frames, centers, amps, fwhms, n_frames=2, min_track_frames=1,
+        similarity=lambda a, b: float("nan"), min_similarity=0.0,
+    )
+    assert sorted(t["rows"].tolist() for t in tracks) == [[0], [1], [2]]
+
+    # One-to-one survives the gate: two frame-1 peaks, both preferring the
+    # same track by similarity, cannot both join it.
+    frames2 = np.array([0, 0, 1, 1])
+    centers2 = np.array([1.0, 2.0, 1.4, 1.6])
+    amps2 = np.ones(4)
+    fwhms2 = np.full(4, 0.6)
+    always_high = lambda a, b: 0.9
+    tracks = link_tracks(
+        frames2, centers2, amps2, fwhms2, n_frames=2, min_track_frames=1,
+        similarity=always_high, min_similarity=0.2,
+    )
+    all_rows = sorted(r for t in tracks for r in t["rows"].tolist())
+    assert all_rows == [0, 1, 2, 3]
+    assert all(len(set(t["rows"].tolist())) == t["rows"].size for t in tracks)
+
+
 def test_williamson_hall():
     """Recover known size/strain: dq = 2*pi*K/D + 2*eps*q."""
     K, D, eps = 0.9, 400.0, 0.002

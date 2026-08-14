@@ -2,9 +2,9 @@ cff-version: 1.2.0
 message: "If you use SeriesXRD in your research, please cite the software using this metadata."
 title: "SeriesXRD"
 type: software
-version: 0.4.0
+version: 0.5.0
 doi: "10.5281/zenodo.21650823"
-date-released: 2026-07-29
+date-released: 2026-08-13
 authors:
   - family-names: "Maples"
     given-names: "Rush"

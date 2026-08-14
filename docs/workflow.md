@@ -1,10 +1,11 @@
 # seriesxrd workflow guide
 
-End-to-end guide to running a powder-XRD series through seriesxrd: calibrate,
-reduce, analyze. Written for a pressure series (diamond-anvil cell), but the
-same stages and knobs apply to a temperature series, a time series, or a
-spatial mapping scan — the series axis is just a different column of
-per-frame metadata. Where something is pressure-specific, it says so.
+End-to-end guide to running an XRD series through seriesxrd: calibrate,
+reduce, analyze, correlate. Written for a pressure series (diamond-anvil
+cell), but the same stages and knobs apply to a temperature series, a time
+series, or a spatial mapping scan — the series axis is just a different
+column of per-frame metadata. Where something is pressure-specific, it says
+so.
 
 Covers the GUI (`seriesxrd`) and the CLI (`seriesxrd-analyze` and friends), with
 emphasis on parameter tuning and file management. For the ML/benchmark
@@ -27,8 +28,8 @@ references it.
 
 ## 1. Overview
 
-Three stages, run in order. Each stage reads the previous stage's output and
-writes one file that hands off to the next stage.
+Four stages, run in order. Each stage reads the previous stage's disk artifact
+and writes the artifacts used by the next stage or by result review.
 
 ```
 raw detector frames + a calibrant image
@@ -57,7 +58,15 @@ raw detector frames + a calibrant image
         - writes <reduced_stem>_analysis.h5
         |
         v
-  per-substance heatmaps, pressure/temperature/frame series, ML export
+  [4. CORRELATE]  correlations/gui.py
+                   (seriesxrd-correlations-gui / seriesxrd-correlate)
+        - positive-Log² ROI and signed-residual Log² windows
+          share one pooled scale and epsilon
+        - all-peak ROI-area and location correlation maps
+        - original-positive waterfall shaded by the Log² ROI result
+        - direct + standardized positive-lag FFT-ACF window maps
+        - writes correlations_<sample_type>.h5,
+          manifest_<sample_type>.json, and review PNGs
 ```
 
 | Stage | Reads | Writes | GUI | CLI |
@@ -65,19 +74,22 @@ raw detector frames + a calibrant image
 | Calibrate | calibrant image + PONI | `calibration_handoff.json` (PONI + mask) | `seriesxrd-calib-gui` | none (worker only) |
 | Reduce | handoff JSON + dataset folder | `reduced_<session>_<ts>.h5` | `seriesxrd-reduce-gui` | none for a batch run (worker only); `seriesxrd-watch` for live mode |
 | Analyze | reduced `.h5` | `<stem>_analysis.h5` | `seriesxrd-analysis-gui` | `seriesxrd-analyze` |
+| Correlate | Analysis `.h5` | `correlations_<sample_type>.h5`, `manifest_<sample_type>.json`, heatmap PNGs | `seriesxrd-correlations-gui` | `seriesxrd-correlate` |
 
 Calibration has no polished argument-per-flag CLI the way analysis does. A
 batch reduction likewise has none — see
-[§3.4](#34-headless-driving-of-calibrationreduction) for what running either
+[§3.5](#35-headless-driving-of-calibrationreduction) for what running either
 stage without the GUI actually looks like. Reduction's live-mode counterpart
-is the exception: `seriesxrd-watch` (see [§3.5](#35-live-mode-during-a-beamtime-seriesxrd-watch))
+is the exception: `seriesxrd-watch` (see [§3.6](#36-live-mode-during-a-beamtime-seriesxrd-watch))
 is a fully-flagged, documented CLI in its own right.
 
-The unified launcher `seriesxrd` embeds all three stages as tabs in one window
+The unified launcher `seriesxrd` embeds all four stages as tabs in one window
 and wires the handoffs automatically: accepting a calibration fills in the
-Reduction tab, and a finished reduction fills in the Analysis tab. The
+Reduction tab, a finished reduction fills in Analysis, and a finished analysis
+fills in Correlations. The
 per-stage entry points (`seriesxrd-calib-gui`, `seriesxrd-reduce-gui`,
-`seriesxrd-analysis-gui`) still work standalone if you only need one stage.
+`seriesxrd-analysis-gui`, `seriesxrd-correlations-gui`) still work standalone
+if you only need one stage.
 
 ## 2. Quick start
 
@@ -89,9 +101,9 @@ seriesxrd --workspace ~/my_experiment
 
 This creates `~/my_experiment/` (default workspace is `~/seriesxrd_workspace`
 if `--workspace` is omitted) with a `calibration_session_config.json`,
-`reduction_session_config.json`, and `analysis_session_config.json` seeded
-inside it, and opens a window with three tabs: **1 Calibration**, **2
-Reduction**, **3 Analysis**.
+`reduction_session_config.json`, `analysis_session_config.json`, and
+`correlation_session_config.json` seeded inside it, and opens a window with
+four tabs: **1 Calibration**, **2 Reduction**, **3 Analysis**, **4 Correlations**.
 
 1. **Calibration tab**: point "Calibration image" at a CeO2/LaB6/Si frame and
    "Input PONI" at its geometry file, build a mask, click "Generate QA run",
@@ -109,12 +121,18 @@ Reduction**, **3 Analysis**.
    the **4 Phases** tab, then **7 Run** → "Run analysis". Inspect results on
    **8 Pattern review** / **9 Peak map** / **10 Phase map** / **11 Unknowns** /
    **12 Spatial map**.
+4. **Correlations tab**: confirm the Analysis HDF5, choose powder or
+   single-crystal observations and a baseline-free profile source, then run.
+   Single-crystal mode selects the recommended `spots` source. The transform
+   is intentionally fixed to Log². Review the recursively listed PNG heatmaps
+   in the Results page; numerical truth remains in the sample-specific
+   `correlations_<sample_type>.h5`.
 
 ### CLI route
 
-The CLI only covers the analysis stage — calibration and reduction still need
-a run through their GUIs (or their config JSON + worker script, see
-[§3.4](#34-headless-driving-of-calibrationreduction)) at least once to
+The stable CLIs cover analysis and correlations — calibration and reduction
+still need a run through their GUIs (or their config JSON + worker script, see
+[§3.5](#35-headless-driving-of-calibrationreduction)) at least once to
 produce the reduced HDF5. Once you have `reduced_myrun.h5`:
 
 ```bash
@@ -127,6 +145,16 @@ seriesxrd-analyze reduced_myrun.h5 \
     --phases Au,Re,NaCl-B1 --workspace ~/my_experiment \
     --pressure-csv pressures.csv \
     -o myrun_analysis.h5
+
+# Powder all-peak maps from Analysis Step 2 peaks.
+seriesxrd-correlate myrun_analysis.h5 \
+    --out ~/my_experiment/correlations \
+    --sample-type powder --source fit
+
+# Single-crystal all-observation maps after seriesxrd-spots has written /spots/obs.
+seriesxrd-correlate myrun_analysis.h5 \
+    --out ~/my_experiment/correlations \
+    --sample-type single_crystal --source spots
 ```
 
 `--workspace` points at the folder holding your user phase library
@@ -189,7 +217,7 @@ Six tabs, in order:
    interval in seconds. The live file is handed to the Review tab and the
    Analysis stage as soon as it is created, and Stop finishes the current
    batch gracefully rather than killing it mid-append. See
-   [§3.5](#35-live-mode-during-a-beamtime-seriesxrd-watch) for the equivalent
+   [§3.6](#36-live-mode-during-a-beamtime-seriesxrd-watch) for the equivalent
    CLI (`seriesxrd-watch`) and the full behavior — this tab is a thin front end
    over the same worker.
 5. **5 Review** — inspector for the reduced HDF5: structure summary plus
@@ -265,7 +293,124 @@ the Unknowns tab. The Peak map tab exposes Williamson–Hall microstructure
 analysis (size/strain per frame from FWHM vs. q), including an explicit warning
 when no instrument-width correction is supplied.
 
-### 3.4 Headless driving of calibration/reduction
+### 3.4 Correlations (`seriesxrd-correlations-gui`)
+
+Four pages expose the same supported batch contract as `seriesxrd-correlate`:
+
+1. **Input** — the Analysis HDF5 and a workspace result folder. A completed
+   Analysis run is handed here automatically by the unified application.
+2. **Settings** — `powder` or `single_crystal`, a baseline-free Analysis
+   profile source, the frame ordering axis (`frame` keeps file order;
+   `pressure`/`temperature`/`time` order the series physically), optional
+   radial bounds, window width/step, the native-axis tolerance for
+   peak-location similarity, the pooled-scale quantile, PNG controls
+   (skip rendering, per-anchor plot cap), and the exploratory peak-track
+   knobs (ROI-similarity gate, minimum frames, position gate, frame-gap
+   tolerance, scan/folder grouping). Single-crystal mode defaults to the
+   recommended `spots` source. Window width and step use the selected HDF5
+   radial unit, and width cannot exceed the selected radial span. The
+   intensity transform is fixed to Log². Every setting is locked while a
+   run is live.
+3. **Run correlations** — launches an isolated headless subprocess and
+   streams its `[CORRELATIONS] done total` progress into a live progress
+   bar; on success the completion line summarizes frames, valid anchors,
+   windows, tracks, and PNGs from the run manifest.
+4. **Results** — lists every figure the artifact can draw, built from the
+   artifact itself rather than from files on disk, and renders the selected
+   one on demand into an embedded canvas with pan/zoom/save. The list
+   appears immediately even when no PNG has ever been written. It provides
+   a text search and a hierarchy of sample type →
+   diagram type → pressure → image. ROI-area, location, and waterfall plots
+   use the anchor pressure; within-frame window plots use the source frame's
+   pressure. Across-frame window plots compare the full series and therefore
+   appear under **All pressures**, as do the peak-track overviews.
+   Selecting a leaf loads only that preview, so large result sets do not all
+   enter GUI memory at once. **Open folder** reveals the result directory and
+   **Export CSV…** writes the summary CSV set for the reviewed artifact.
+
+The required upstream observation table depends on sample type. Powder uses
+every good row in `/peaks` (run Analysis Step 2). Single-crystal uses every row
+in `/spots/obs`. Add that table to the Analysis HDF5 before correlating:
+
+```bash
+seriesxrd-spots REDUCED.h5 --analysis ANALYSIS.h5
+```
+
+Its ROI feature is the mean
+positive-Log² value in a one-dimensional radial ROI, an explicit approximation
+of the prototype's raw-pixel ROI. A stored track ID is retained as provenance
+but is never used to group or collapse observations.
+
+For ROI comparisons, the Analysis background-corrected source is clipped to
+its positive part and transformed using one scale and one noise-derived
+epsilon pooled over all included frames:
+
+```text
+z = clip(max(I, 0) / scale, 0, 1)
+Log²(I) = log1p(z² / epsilon) / log1p(1 / epsilon)
+```
+
+Windows reuse that exact pooled scale and epsilon but preserve the signed
+background residual before the nonlinear transform:
+
+```text
+z_window = clip(residual / scale, -1, 1)
+Log²_window = log1p(z_window² / epsilon) / log1p(1 / epsilon)
+```
+
+This bounded nonlinear transform is not spatial smoothing. ROI-area maps use
+the positive transformed profiles; location maps compare fitted centers and
+therefore do not use an intensity transform. Target peaks in the anchor's own
+frame are structural `NaN` cells and appear blank. Waterfall height is the
+original-positive profile, while its shaded ROI colors come from the Log²
+ROI-area result. Window outputs include direct comparisons and standardized
+positive-lag FFT-ACF fingerprints; lag zero is excluded. The formal MVP does
+not include the prototype's `shift_tolerant_secondary` or same-scan
+aggregation because Analysis HDF5 has no stable `scan_id`.
+
+The supported CLI mirrors the GUI:
+
+```bash
+seriesxrd-correlate ANALYSIS.h5 --out RESULTS \
+    --sample-type powder --source fit --order-by pressure \
+    --radial-min 2.0 --radial-max 12.0 \
+    --window-width 5.0 --window-step 1.0 \
+    --location-tolerance 0.02 --export-csv --max-anchor-plots 50
+```
+
+**Bulk PNG rendering is off by default.** Every number is in the artifact
+and the GUI draws figures on demand, so a routine run writes no images. Ask
+for files explicitly with `--plots all`, or name families
+(`--plots waterfall --plots tracks`); `--max-anchor-plots N` caps the
+per-anchor PNGs while leaving the matrices complete in the HDF5.
+`--no-plots` is still accepted and is now a no-op. Use `--export-csv` /
+`--export-matrices` for spreadsheet-ready tables under `RESULTS/csv`, and
+`--no-tracks` to skip the exploratory ROI-gated peak tracks.
+
+**Stopping and resuming.** Ctrl-C, or the GUI's Cancel, stops at the next
+figure boundary and keeps everything already rendered; the run exits 130
+and prints the command that continues it. Re-run with `--resume` to reuse
+the existing artifact — when the Analysis file and the compute settings are
+unchanged, verified through `/provenance` — and to skip figures already on
+disk. Figures stranded by a run that died appear in the GUI's Results tree
+under an "incomplete (interrupted run)" heading and can be published with
+**Promote staged…**, which records `INCOMPLETE.json` alongside them. Track linking reuses the Step-3c linker with the
+mutual ROI similarity `sqrt(S(A→B)·S(B→A))` as its evidence gate
+(`--track-min-similarity`, `0` = positional-only), links only within
+`--track-group-by` groups, and screens adjacent ordered intervals for
+coincident births/deaths and across-window correlation drops. Flagged
+intervals are exploratory candidates to inspect, never confirmed
+transitions.
+Powder writes `correlations_powder.h5` plus `manifest_powder.json`; single
+crystal writes `correlations_single_crystal.h5` plus
+`manifest_single_crystal.json`. Both numerical pairs safely coexist in one
+result directory, while review images remain separated under
+`heatmaps/powder` and `heatmaps/single_crystal`.
+See [`file-format.md`](file-format.md) for the numeric schema and
+[`validation.md`](validation.md) before interpreting similarities as phase
+identity.
+
+### 3.5 Headless driving of calibration/reduction
 
 There's no `seriesxrd-calibrate`/`seriesxrd-reduce` console script. What the
 GUI's "Generate QA run" / "Run reduction" buttons actually do is launch:
@@ -293,7 +438,7 @@ detection knob the GUI has (`--min-snr`, `--min-prominence-snr`,
 `seriesxrd.analysis.peaks.run_peak_fitting(...)` /
 `seriesxrd.analysis.worker.run_analysis(config_dict)` from your own script.
 
-### 3.5 Live mode during a beamtime (`seriesxrd-watch`)
+### 3.6 Live mode during a beamtime (`seriesxrd-watch`)
 
 ```bash
 seriesxrd-watch --workspace ~/my_experiment            # needs an accepted calibration
@@ -732,19 +877,45 @@ was physically collected on, colored by a per-frame scalar.
 
 Hovering the rendered grid shows the underlying frame index and value.
 
+### 6.6 Correlation heatmaps (correlations page 4)
+
+The Correlations Results page lists only the current result folder's PNGs and
+previews one selected image at a time. Its search field filters the displayed
+results, which are organized as sample type (`powder` or `single_crystal`) →
+diagram type → pressure → image. ROI-area, location, and shaded waterfalls use
+the anchor pressure. Across-frame products compare multiple pressure frames,
+so their `direct` and `acf` maps are grouped under **All pressures**.
+Within-frame ACF products are grouped by that frame's pressure. Re-running one
+sample type replaces that sample type's managed image tree, so heatmaps from
+an older run cannot be mistaken for current results; the sibling sample type
+is left untouched.
+
+Across-frame and within-frame matrices are symmetric; for every valid window,
+the diagonal is the predetermined self-correlation value 1. To avoid showing
+duplicate or predetermined cells, the review PNGs display only the strict
+lower triangle: the upper triangle and diagonal are blank. This is
+presentation-only; the complete square matrices remain in the sample-specific
+HDF5 for numerical use.
+
+The PNGs are review views, not the numeric record. Use
+`correlations_powder.h5` or `correlations_single_crystal.h5` for exact values,
+transform parameters, support definitions, and provenance. Both files and
+their sample-specific manifests are retained in a shared result folder.
+
 ## 7. File management
 
 ### 7.1 Workspace layout
 
 A workspace (the folder you point `--workspace` at, or the folder holding
 your session config JSONs when running a stage standalone) has this shape
-once you've run all three stages once:
+once you've run all four stages once:
 
 ```
 <workspace>/
   calibration_session_config.json     stage-1 config  (gitignored, local paths)
   reduction_session_config.json       stage-2 config  (gitignored, local paths)
   analysis_session_config.json        stage-3 config  (gitignored, local paths)
+  correlation_session_config.json     stage-4 config  (gitignored, local paths)
   reference_phases/                   user phase library (gitignored)
     user_phases.json
     <imported CIFs>
@@ -759,6 +930,14 @@ once you've run all three stages once:
                                               in place, no cakes/thumbnails; run a full
                                               reduction for the archival file)
       <reduced_stem>_analysis.h5             (default analysis output, beside the reduced file)
+  correlations/
+    correlations_powder.h5           powder numeric correlation run
+    manifest_powder.json              powder settings and generated-product list
+    correlations_single_crystal.h5   single-crystal numeric correlation run
+    manifest_single_crystal.json      single-crystal settings and product list
+    heatmaps/
+      powder/                         generated powder review images by product
+      single_crystal/                 generated single-crystal review images
   figures/                            calibration QA figures (per generation)
   metadata/
     <workflow_name>/genNNN/*_metadata_*.json      calibration QA generation records
@@ -785,7 +964,7 @@ once you've run all three stages once:
 ```
 
 The session config JSONs *are* your saved parameter tuning — every field you
-set in a GUI tab lives in one of these three files, keyed by the names used
+set in a GUI tab lives in one of these four files, keyed by the names used
 throughout §4 (e.g. `max_half_window`, `peak_source`, `pressure_window`).
 Re-opening the same workspace restores every knob exactly where you left it.
 
@@ -800,6 +979,8 @@ Re-opening the same workspace restores every knob exactly where you left it.
 | `reduced_*.h5` | No — this is the reduction stage's entire output | Re-generating it re-runs the full integration over every frame. Keep it; it's the input every analysis run starts from. |
 | `reduced_*_live.h5` (`seriesxrd-watch` output) | Yes, once you've run a normal full reduction over the same dataset | It's a working view, not the archival file — no cakes/thumbnails, appended in place rather than atomically. Regenerable only by re-watching (`--resume` continues an interrupted one) or by a full reduction, which is the archival path anyway. |
 | `<stem>_analysis.h5` | Regenerable from the reduced file, but keep it if you've spent time tuning Step 2/3 parameters or have run Step 3a/ML export | Re-running the analysis worker rebuilds it from scratch (each step is not free — Step 3a in particular can be slow with many candidate phases). |
+| `correlations/heatmaps/` | Yes | Review PNGs are regenerated from the correlation run; keep the sample-specific HDF5 and manifest when you need exact numeric provenance. |
+| `correlations/correlations_powder.h5` and `correlations/correlations_single_crystal.h5` | Regenerable from the Analysis HDF5 | Keep them for exact numeric results; all-peak matrices can be expensive and large. |
 | `accepted_calibrations/.../calibration_handoff.json` + its `accepted_calibration/` folder | No | This is the calibration stage's entire deliverable and the reduction stage's only input. Small (a PONI + a mask + a couple of PNGs); back it up with your data. |
 | `reference_phases/user_phases.json` + imported CIFs | No | Your hand-entered/imported phase library. Not regenerable without re-entering every phase. |
 
@@ -808,7 +989,8 @@ Re-opening the same workspace restores every knob exactly where you left it.
 Every stage writes its `.h5` output as `<name>.h5.tmp`, then calls
 `os.replace()` to the final name only after the write completes without
 error; any exception mid-write deletes the `.tmp` instead of leaving a
-truncated file. So a `reduced_*.h5` or `<stem>_analysis.h5` on disk is always
+truncated file. So a `reduced_*.h5`, `<stem>_analysis.h5`,
+`correlations_powder.h5`, or `correlations_single_crystal.h5` on disk is always
 either complete or absent — never partially written. Session config JSONs
 follow the same pattern.
 
@@ -827,12 +1009,13 @@ they aren't part of this copy.
 
 If your workspace happens to sit inside this repository (not the normal
 case — a workspace is ordinarily an arbitrary folder outside the repo), note
-that `.gitignore` excludes essentially everything a run produces: all three
+that `.gitignore` excludes essentially everything a run produces: all four
 session config JSONs, `calibration_handoff.json`, `master_metadata.json`,
-`last_preflight.json`, `data/`, `figures/`, `metadata/`, `logs/`, `previews/`,
-`reference_phases/`, and raw data extensions (`*.tif`, `*.tiff`, `*.edf`,
-`*.npy`, `*.npz`, `*.csv`). The schema for a session config is documented by
-example at `examples/calibration_session_config.example.json`. None of this
+`last_preflight.json`, `data/`, `correlations/`, `figures/`, `metadata/`,
+`logs/`, `previews/`, `reference_phases/`, and raw data extensions (`*.tif`,
+`*.tiff`, `*.edf`, `*.npy`, `*.npz`, `*.csv`). The schema for a session config
+is documented by example at
+`examples/calibration_session_config.example.json`. None of this
 is committed on purpose — these files hold local absolute paths and, in the
 case of raw data, can be arbitrarily large.
 

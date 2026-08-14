@@ -29,6 +29,8 @@ def test_unified_app_constructs_and_closes():
         "from seriesxrd.guikit import theme\n"
         "app = SeriesXRDApp(sys.argv[1])\n"
         "assert 'refinement' in app.analysis_pane.pages\n"
+        "assert tuple(app.correlation_pane.pages) == "
+        "('input', 'settings', 'run', 'results')\n"
         "app.root.update_idletasks()\n"
         "app.root.update()\n"
         "fig = Figure()\n"

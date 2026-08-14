@@ -80,6 +80,24 @@ def test_terminate_process_tree_kills_stdout_child_quickly():
         assert not _pid_running(child_pid)
 
 
+def test_open_in_file_manager_uses_platform_launcher(monkeypatch, tmp_path):
+    from seriesxrd.core import processes
+
+    launched = []
+    monkeypatch.setattr(
+        processes.subprocess, "Popen",
+        lambda args, **_kwargs: launched.append(list(args)),
+    )
+    if sys.platform.startswith("win"):
+        monkeypatch.setattr(
+            processes.os, "startfile",
+            lambda target: launched.append(["startfile", target]),
+            raising=False,
+        )
+    processes.open_in_file_manager(tmp_path)
+    assert launched and str(tmp_path) in launched[0][-1]
+
+
 def main() -> None:
     test_terminate_process_tree_kills_stdout_child_quickly()
     print("PROCESS TEST OK")

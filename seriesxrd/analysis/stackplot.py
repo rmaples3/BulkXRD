@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-__all__ = ["stack_figure", "main"]
+__all__ = ["mad_noise", "main", "robust_amp", "stack_figure"]
 
 
 def _robust_amp(y: np.ndarray) -> float:
@@ -51,6 +51,12 @@ def _mad_noise(y: np.ndarray) -> float:
     if y.size < 8:
         return 0.0
     return float(np.nanmedian(np.abs(y - np.nanmedian(y))) * 1.4826)
+
+
+# Public names: the correlations waterfall shares this per-frame
+# normalization so a zinger cannot flatten a trace there either.
+robust_amp = _robust_amp
+mad_noise = _mad_noise
 
 
 # Figure-output presets for GUI/CLI exports: where the figure will live
