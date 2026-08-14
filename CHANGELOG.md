@@ -5,6 +5,8 @@ semantic versioning once a stable public API is declared.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-13
+
 ### Added
 
 - **Figures render on demand.** The Correlations Results page lists every
