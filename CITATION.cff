@@ -3,7 +3,7 @@ message: "If you use SeriesXRD in your research, please cite the software using 
 title: "SeriesXRD"
 type: software
 version: 0.5.0
-doi: "10.5281/zenodo.21650823"
+doi: "10.5281/zenodo.21939548"
 date-released: 2026-08-13
 authors:
   - family-names: "Maples"
